@@ -61,7 +61,19 @@ import geokitpy as gkp
 PointCollection = Union[List[Point], Tuple[Point, ...],
                         MultiPoint, np.ndarray, pd.DataFrame]
 
-def check_strike_dip(strike:float, dip:float)->None:
+def check_strike_dip(strike: float, dip: float) -> None:
+    """Checks if the provided strike and dip are valid numbers.
+
+    Args:
+        strike (float): The strike angle.
+        dip (float): The dip angle.
+
+    Returns:
+        None
+
+    Raises:
+        TypeError: If strike or dip is not a number or is NaN.
+    """
     message  = 'strike and/or dip not a valid type. '
     message += f'strike:{strike}; dip:{dip}'
     type_error = TypeError(message)
@@ -74,25 +86,67 @@ def check_strike_dip(strike:float, dip:float)->None:
         #at least one is nan
         raise type_error
 
-def build_flat_disk_perimeter_xy(*,radius:float, num_sides:int):
+def build_flat_disk_perimeter_xy(*, radius: float, num_sides: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Builds the x and y coordinates for a flat disk perimeter.
+
+    Args:
+        radius (float): The radius of the disk.
+        num_sides (int): The number of sides for the disk perimeter.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: The x and y coordinates of the disk perimeter.
+    """
     angles = np.linspace(0,2*np.pi,num_sides)
     x = radius*np.cos(angles)
     y = radius*np.sin(angles)
     return x,y
 
-def rotate_flat_polygon_strike_dip(*, x:NDArray, y:NDArray, strike:float, dip:float)->np.ndarray:
+def rotate_flat_polygon_strike_dip(*, x: NDArray, y: NDArray, strike: float, dip: float) -> np.ndarray:
+    """Rotates a flat polygon based on strike and dip angles.
+
+    Args:
+        x (NDArray): The x coordinates of the polygon.
+        y (NDArray): The y coordinates of the polygon.
+        strike (float): The strike angle.
+        dip (float): The dip angle.
+
+    Returns:
+        np.ndarray: The rotated coordinates as a 3D array.
+    """
     z = np.zeros_like(x)
     coords = np.vstack((x,y,z))    
     rot_mat = np.asarray(gkp.Plane(strike,dip).axes.T)
     new_coords = ((rot_mat @ coords)).T    
     return new_coords
 
-def triangulate_perimeter(x:NDArray, y:NDArray)->tuple:
+def triangulate_perimeter(x: NDArray, y: NDArray) -> Tuple[tri.Triangulation, np.ndarray]:
+    """Triangulates a perimeter defined by x and y coordinates.
+
+    Args:
+        x (NDArray): The x coordinates of the perimeter.
+        y (NDArray): The y coordinates of the perimeter.
+
+    Returns:
+        Tuple[tri.Triangulation, np.ndarray]: The triangulation object and the delaunay triangles.
+    """
     triang = tri.Triangulation(x,y)
     delaunay_triangles=triang.triangles
     return triang, delaunay_triangles
     
-def build_disk(strike, dip, center=(0,0,0), radius=1, num_sides=15, **kwargs):
+def build_disk(strike: float, dip: float, center: Tuple[float, float, float] = (0, 0, 0), radius: float = 1, num_sides: int = 15, **kwargs) -> Tuple[np.ndarray, np.ndarray]:
+    """Builds a 3D disk with the specified strike, dip, center, and radius.
+
+    Args:
+        strike (float): The strike angle.
+        dip (float): The dip angle.
+        center (Tuple[float, float, float], optional): The center coordinates. Defaults to (0,0,0).
+        radius (float, optional): The radius of the disk. Defaults to 1.
+        num_sides (int, optional): The number of sides for the disk perimeter. Defaults to 15.
+        **kwargs: Additional keyword arguments.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: The 3D coordinates of the disk and the delaunay triangles.
+    """
     check_strike_dip(strike, dip)    
     x,y = build_flat_disk_perimeter_xy(radius=radius, num_sides=num_sides)     
     triangles, delaunay_triangles = triangulate_perimeter(x, y)    
@@ -105,11 +159,27 @@ def build_disk(strike, dip, center=(0,0,0), radius=1, num_sides=15, **kwargs):
     return new_coords, delaunay_triangles
 
 
-def xy_grid(origin:tuple,
-            x_negative_dist:float, x_positive_dist:float,        
-            y_negative_dist:float, y_positive_dist:float, 
-            resolution:float=None, n_elements:int=None):
-    
+def xy_grid(origin: tuple,
+            x_negative_dist: float, x_positive_dist: float,        
+            y_negative_dist: float, y_positive_dist: float, 
+            resolution: Optional[float] = None, n_elements: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Generates an XY grid based on origin and distances.
+
+    Args:
+        origin (tuple): The origin coordinates (x, y).
+        x_negative_dist (float): Distance in the negative X direction.
+        x_positive_dist (float): Distance in the positive X direction.
+        y_negative_dist (float): Distance in the negative Y direction.
+        y_positive_dist (float): Distance in the positive Y direction.
+        resolution (Optional[float], optional): Grid resolution. Defaults to None.
+        n_elements (Optional[int], optional): Number of elements. Defaults to None.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: The X and Y mesh grids.
+
+    Raises:
+        ValueError: If neither resolution nor n_elements is provided.
+    """
     xmin = origin[0]+x_negative_dist
     xmax = origin[0]+x_positive_dist    
     ymin = origin[1]+y_negative_dist
@@ -131,9 +201,22 @@ def xy_grid(origin:tuple,
     return X, np.flipud(Y)
 
 
-def build_rectangular_mesh(*,strike, dip, center, i_elements, i_length,
-                           j_elements, j_length):
-    
+def build_rectangular_mesh(*, strike: float, dip: float, center: Tuple[float, float, float], i_elements: int, i_length: float,
+                           j_elements: int, j_length: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Builds a 3D rectangular mesh with a specified strike, dip, and dimensions.
+
+    Args:
+        strike (float): The strike angle.
+        dip (float): The dip angle.
+        center (Tuple[float, float, float]): The center coordinates.
+        i_elements (int): Number of elements along the I axis.
+        i_length (float): Total length along the I axis.
+        j_elements (int): Number of elements along the J axis.
+        j_length (float): Total length along the J axis.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: The 3D coordinates and delaunay triangles.
+    """
     import matplotlib.tri as tri
     
     i_points = np.linspace(-i_length/2,i_length/2,i_elements)
@@ -153,9 +236,19 @@ def build_rectangular_mesh(*,strike, dip, center, i_elements, i_length,
     return new_coords.T, delaunay_triangles
 
 
-def z_for_plane3d(point_on_plane:tuple, plane:gkp.Plane=None,
-                  strike:float=None, dip:float=None) -> Callable:
-    
+def z_for_plane3d(point_on_plane: tuple, plane: Optional[gkp.Plane] = None,
+                  strike: Optional[float] = None, dip: Optional[float] = None) -> Callable:
+    """Returns a function to compute Z given X and Y for a 3D plane.
+
+    Args:
+        point_on_plane (tuple): A point lying on the plane (x, y, z).
+        plane (Optional[gkp.Plane], optional): A plane object. Defaults to None.
+        strike (Optional[float], optional): The strike angle. Defaults to None.
+        dip (Optional[float], optional): The dip angle. Defaults to None.
+
+    Returns:
+        Callable: A function taking (x, y) and returning z.
+    """
     if plane is None:
         plane = gkp.Plane(strike, dip)
         
@@ -168,9 +261,20 @@ def z_for_plane3d(point_on_plane:tuple, plane:gkp.Plane=None,
     return z
         
 
-def z_plane3d_xygrid(xy_grid: tuple, point_on_plane: tuple, 
-                    plane:gkp.Plane=None, strike:float=None, dip:float=None):
-    
+def z_plane3d_xygrid(xy_grid: Tuple[np.ndarray, np.ndarray], point_on_plane: tuple, 
+                    plane: Optional[gkp.Plane] = None, strike: Optional[float] = None, dip: Optional[float] = None) -> np.ndarray:
+    """Calculates Z values for a 2D XY grid based on a 3D plane.
+
+    Args:
+        xy_grid (Tuple[np.ndarray, np.ndarray]): The X and Y mesh grids.
+        point_on_plane (tuple): A point lying on the plane.
+        plane (Optional[gkp.Plane], optional): A plane object. Defaults to None.
+        strike (Optional[float], optional): The strike angle. Defaults to None.
+        dip (Optional[float], optional): The dip angle. Defaults to None.
+
+    Returns:
+        np.ndarray: The computed Z values on the grid.
+    """
     z_func = z_for_plane3d(point_on_plane, plane=plane,
                       strike=strike, dip=dip)
     
@@ -180,11 +284,25 @@ def z_plane3d_xygrid(xy_grid: tuple, point_on_plane: tuple,
     return z
     
     
-def build_vertical_surface(surface_path:shapely.Geometry,
-                           max_segment_length=100,
-                           xsection_top:float=900,
-                           xsection_bottom:float=-4000,
-                           )->"trimesh.Trimesh":
+def build_vertical_surface(surface_path: shapely.Geometry,
+                           max_segment_length: float = 100,
+                           xsection_top: float = 900,
+                           xsection_bottom: float = -4000,
+                           ) -> "trimesh.Trimesh":
+    """Builds a vertical 3D surface (mesh) by extruding a 2D path.
+
+    Args:
+        surface_path (shapely.Geometry): The 2D path (LineString, etc.).
+        max_segment_length (float, optional): Maximum length for segmentizing. Defaults to 100.
+        xsection_top (float, optional): The top Z elevation. Defaults to 900.
+        xsection_bottom (float, optional): The bottom Z elevation. Defaults to -4000.
+
+    Returns:
+        trimesh.Trimesh: The resulting vertical surface mesh.
+        
+    Raises:
+        ValueError: If trimesh is not available or geometry type is unsupported.
+    """
     if not TRIMESH:
         raise ValueError("Module trimesh needed to run this function")
     #Read and format data
@@ -223,11 +341,20 @@ def build_vertical_surface(surface_path:shapely.Geometry,
     return surface
 
 
-def build_surface_from_polylines(line1:shapely.LineString,
-                                 line2:shapely.LineString)->tuple:    
-    '''
-    Takes two lines performs a triangulation and returns a 3D mesh
-    '''
+def build_surface_from_polylines(line1: shapely.LineString,
+                                 line2: shapely.LineString) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int], List[int], List[int]]:
+    """Takes two lines, performs a triangulation, and returns a 3D mesh.
+
+    Args:
+        line1 (shapely.LineString): The top line.
+        line2 (shapely.LineString): The bottom line.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray, List[int], List[int], List[int]]: The x, y, z coordinates and i, j, k indices for the triangles.
+
+    Raises:
+        TypeError: If line1 or line2 is not a shapely.LineString.
+    """
     
     if not (isinstance(line1, shapely.LineString) and isinstance(line2, shapely.LineString)):
         raise TypeError("line1 and line2 must be shapely.LineString")
@@ -274,8 +401,21 @@ def build_surface_from_polylines(line1:shapely.LineString,
         
     return x,y,z,i_idx,j_idx,k_idx
 
-def build_vertical_surface_from_one_polyline_extrusion(line:shapely.LineString,
-                                             extrusion_distance:float)->tuple:
+def build_vertical_surface_from_one_polyline_extrusion(line: shapely.LineString,
+                                             extrusion_distance: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int], List[int], List[int]]:
+    """Builds a vertical surface by extruding a single polyline downwards or upwards.
+
+    Args:
+        line (shapely.LineString): The input polyline.
+        extrusion_distance (float): The distance to extrude in the Z direction.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray, List[int], List[int], List[int]]: The x, y, z coordinates and i, j, k triangle indices.
+
+    Raises:
+        TypeError: If line is not a shapely.LineString.
+        ValueError: If the polyline does not have a constant Z value.
+    """
     if not isinstance(line, shapely.LineString):
         raise TypeError("line must be a shapely.LineString")
         
@@ -366,33 +506,51 @@ def build_vertical_surface_from_one_polyline_extrusion(line:shapely.LineString,
 #     return tup
 
 def build_triangulated_surface_from_lengths(*,
-                                        n_horizontal:int,
-                                        n_vertical:int)->tri.Triangulation:
-    '''
-    Builds a triangulated surface from the lengths of 2 dimensions.
+                                        n_horizontal: int,
+                                        n_vertical: int) -> tri.Triangulation:
+    """Builds a triangulated surface from the lengths of 2 dimensions.
+
     It is used to build any surface with 2 dimensions.
-    The final triang_obj can be mapped to any coordinates
+    The final triang_obj can be mapped to any coordinates.
     The resulting triang_obj.triangles contain the flattened indices that can be used
-    after to map real coordinates
+    after to map real coordinates.
     
     It works best if the real coordinates have regular spacing.
-    
-    It can be used to generate vertical surfaces like a vertical xsection (seismic or geologic)
-    '''
+    It can be used to generate vertical surfaces like a vertical xsection (seismic or geologic).
+
+    Args:
+        n_horizontal (int): The number of horizontal points.
+        n_vertical (int): The number of vertical points.
+
+    Returns:
+        tri.Triangulation: The created triangulation object.
+    """
     hor = range(n_horizontal)
     vert = range(n_vertical)
     H, Z = np.meshgrid(hor,vert)
     triang_obj = tri.Triangulation(H.flat, Z.flat)
     return triang_obj
     
-def build_vertical_surface_polyline_and_zlevels(*,x:ArrayLike,
-                                                y:ArrayLike,
-                                                z:ArrayLike,)->tuple:
-    '''    
-    x,y and z are 1D arrays
-    xy define a polyline at a fixed depth = z[0]
-    z positions the xy polyline and defines the coordinates at depth
-    '''    
+def build_vertical_surface_polyline_and_zlevels(*, x: ArrayLike,
+                                                y: ArrayLike,
+                                                z: ArrayLike) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Builds a vertical surface from a polyline at fixed depth and a series of depth levels.
+
+    x, y and z are 1D arrays.
+    xy define a polyline at a fixed depth = z[0].
+    z positions the xy polyline and defines the coordinates at depth.
+
+    Args:
+        x (ArrayLike): 1D array of x coordinates for the polyline.
+        y (ArrayLike): 1D array of y coordinates for the polyline.
+        z (ArrayLike): 1D array of z levels.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]: The x, y, z flats and i, j, k triangle indices.
+        
+    Raises:
+        ValueError: If x and y do not have the same length.
+    """    
     if x.size != y.size:
         raise ValueError('x and y must have the same length')
     
@@ -415,9 +573,20 @@ def build_vertical_surface_polyline_and_zlevels(*,x:ArrayLike,
     return tup
 
 
-def map_array_to_cmap(*,values:ArrayLike,
-                      mpl_cmap:colors.Colormap=None,
-                      mpl_cmap_name:str=None, **kwargs)->tuple:
+def map_array_to_cmap(*, values: ArrayLike,
+                      mpl_cmap: Optional[colors.Colormap] = None,
+                      mpl_cmap_name: Optional[str] = None, **kwargs) -> np.ndarray:
+    """Maps an array of values to RGBA colors using a matplotlib colormap.
+
+    Args:
+        values (ArrayLike): The array of values to map.
+        mpl_cmap (Optional[colors.Colormap], optional): A matplotlib colormap instance. Defaults to None.
+        mpl_cmap_name (Optional[str], optional): The name of a registered matplotlib colormap. Defaults to None.
+        **kwargs: Additional arguments such as vmin and vmax.
+
+    Returns:
+        np.ndarray: The array of mapped vertex colors.
+    """
     vmin = kwargs.pop('vmin', values.min())
     vmax = kwargs.pop('vmax', values.max())
     
@@ -431,11 +600,27 @@ def map_array_to_cmap(*,values:ArrayLike,
     vertex_colors = cmap(norm(values_flat))
     return vertex_colors
 
-def import_rgb_image_as_vertical_surface(*,filepath:PathLike=None,
-                                         im_array:NDArray=None,
-                                         x:NDArray,
-                                         y:NDArray,
-                                         z:NDArray)->xr.Dataset:
+def import_rgb_image_as_vertical_surface(*, filepath: Optional[PathLike] = None,
+                                         im_array: Optional[NDArray] = None,
+                                         x: NDArray,
+                                         y: NDArray,
+                                         z: NDArray) -> xr.Dataset:
+    """Imports an RGB image and maps it onto a vertical surface as an xarray Dataset.
+
+    Args:
+        filepath (Optional[PathLike], optional): The path to the image file. Defaults to None.
+        im_array (Optional[NDArray], optional): The RGB image array. Defaults to None.
+        x (NDArray): 1D array of x coordinates for the polyline.
+        y (NDArray): 1D array of y coordinates for the polyline.
+        z (NDArray): 1D array of z levels.
+
+    Returns:
+        xr.Dataset: The xarray Dataset containing the mapped image.
+
+    Raises:
+        ValueError: If neither im_array nor filepath is specified, or if shape requirements are not met.
+        TypeError: If im_array dimensions are incorrect, or if x and y differ in size.
+    """
     if im_array is None:
         if filepath is not None:
             im_array = skimage.io.imread(filepath)
@@ -466,15 +651,29 @@ def import_rgb_image_as_vertical_surface(*,filepath:PathLike=None,
     try:
         variables.update(dict(alpha=(('vertical', 'distance'), im_array[..., 3])))
     except IndexError:
-        variables.update(dict(alpha=(('vertical', 'distance'), np.ones(shape[:2])*255)))
+        variables.update(dict(alpha=(('vertical', 'distance'), np.ones(im_array.shape[:2])*255)))
     
     dset = xr.Dataset(data_vars=variables, coords=coords)
     return dset
 
-def map_rgb_image_to_vertical_surface(*, rgb:NDArray,
-                                      x:NDArray,
-                                      y:NDArray,
-                                      z:NDArray)->tuple:
+def map_rgb_image_to_vertical_surface(*, rgb: NDArray,
+                                      x: NDArray,
+                                      y: NDArray,
+                                      z: NDArray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Maps an RGB image array to a vertical surface grid.
+
+    Args:
+        rgb (NDArray): The RGB image array.
+        x (NDArray): 1D array of x coordinates for the polyline.
+        y (NDArray): 1D array of y coordinates for the polyline.
+        z (NDArray): 1D array of z levels.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]: The x, y, z flats, the i, j, k triangle indices, and the flattened RGB array.
+
+    Raises:
+        ValueError: If the shapes of rgb, x, and z are not compatible.
+    """
     if (x.size != rgb.shape[1]) or (z.size!=rgb.shape[0]):
         raise ValueError("This implementation needs that rgb.shape=(z.size, x.size, 3or4)")
         
@@ -488,8 +687,18 @@ def map_rgb_image_to_vertical_surface(*, rgb:NDArray,
     
 
 
-def map_datarray_to_vertical_surface(*,datarray:xr.DataArray,
-                               mpl_cmap_name='seismic', **kwargs)->tuple:
+def map_datarray_to_vertical_surface(*, datarray: xr.DataArray,
+                               mpl_cmap_name: str = 'seismic', **kwargs) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Maps an xarray DataArray to a vertical surface grid with a colormap.
+
+    Args:
+        datarray (xr.DataArray): The input xarray DataArray containing x, y, and z coordinates.
+        mpl_cmap_name (str, optional): The colormap name. Defaults to 'seismic'.
+        **kwargs: Additional keyword arguments.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]: The x, y, z flats, the i, j, k triangle indices, and the vertex colors.
+    """
     tup1 = build_vertical_surface_polyline_and_zlevels(x=datarray.x,
                                                         y=datarray.y,
                                                         z=datarray.z)
@@ -503,7 +712,20 @@ def map_datarray_to_vertical_surface(*,datarray:xr.DataArray,
     
     
 
-def orientations_to_pcloud(strikes, dips, centers, radius=1, num_sides=15, **kwargs):
+def orientations_to_pcloud(strikes: ArrayLike, dips: ArrayLike, centers: ArrayLike, radius: float = 1, num_sides: int = 15, **kwargs) -> pd.DataFrame:
+    """Takes arrays of orientation data and builds disks to create a point cloud.
+
+    Args:
+        strikes (ArrayLike): Array of strike angles.
+        dips (ArrayLike): Array of dip angles.
+        centers (ArrayLike): Array of center coordinates (x, y, z).
+        radius (float, optional): The radius of the disks. Defaults to 1.
+        num_sides (int, optional): The number of sides for the disks. Defaults to 15.
+        **kwargs: Additional keyword arguments.
+
+    Returns:
+        pd.DataFrame: A DataFrame representing the point cloud with 'x', 'y', and 'z' columns.
+    """
     #takes arrays of orientation data and builds disks
     #and creates a pcloud
     coords_lst=[]
@@ -524,41 +746,37 @@ def orientations_to_pcloud(strikes, dips, centers, radius=1, num_sides=15, **kwa
     df = pd.DataFrame(arr, columns=['x','y','z'])
     return df
 
-def rotation_matrix(new_x, new_y, new_z):
-    '''
-    Calculates rotation matrix
-    Checked with Algorithms in Structural Geology on July 2022
+def rotation_matrix(new_x: Union[Tuple, List, ArrayLike, gkp.Vector], new_y: Union[Tuple, List, ArrayLike, gkp.Vector], new_z: Union[Tuple, List, ArrayLike, gkp.Vector]) -> np.ndarray:
+    """Calculates a rotation matrix.
 
-    Parameters
-    ----------
-    new_x : list,tuple (trend, plunge) or Vector (vx, vy, vz)
-    new_y : list,tuple (trend, plunge) or Vector (vx, vy, vz)
-    new_z : list,tuple (trend, plunge) or Vector (vx, vy, vz)
+    Checked with Algorithms in Structural Geology on July 2022.
 
-    Returns
-    -------
-    rotation matrix : 3x3 array
-    '''    
+    Args:
+        new_x (Union[Tuple, List, ArrayLike, gkp.Vector]): (trend, plunge) or Vector (vx, vy, vz).
+        new_y (Union[Tuple, List, ArrayLike, gkp.Vector]): (trend, plunge) or Vector (vx, vy, vz).
+        new_z (Union[Tuple, List, ArrayLike, gkp.Vector]): (trend, plunge) or Vector (vx, vy, vz).
+
+    Returns:
+        np.ndarray: The 3x3 rotation matrix.
+    """    
     
     rotation_matrix = change_base_matrix(new_x, new_y, new_z).T
     
     return rotation_matrix
     
-def change_base_matrix(new_x, new_y, new_z):    
-    '''
-    Calculates rotation matrix
-    Checked with Algorithms in Structural Geology on July 2022
+def change_base_matrix(new_x: Union[Tuple, List, ArrayLike, gkp.Vector], new_y: Union[Tuple, List, ArrayLike, gkp.Vector], new_z: Union[Tuple, List, ArrayLike, gkp.Vector]) -> np.ndarray:    
+    """Calculates a change of base matrix.
 
-    Parameters
-    ----------
-    new_x : list,tuple (trend, plunge) or Vector (vx, vy, vz)
-    new_y : list,tuple (trend, plunge) or Vector (vx, vy, vz)
-    new_z : list,tuple (trend, plunge) or Vector (vx, vy, vz)
+    Checked with Algorithms in Structural Geology on July 2022.
 
-    Returns
-    -------
-    rotation matrix : 3x3 array
-    '''    
+    Args:
+        new_x (Union[Tuple, List, ArrayLike, gkp.Vector]): (trend, plunge) or Vector (vx, vy, vz).
+        new_y (Union[Tuple, List, ArrayLike, gkp.Vector]): (trend, plunge) or Vector (vx, vy, vz).
+        new_z (Union[Tuple, List, ArrayLike, gkp.Vector]): (trend, plunge) or Vector (vx, vy, vz).
+
+    Returns:
+        np.ndarray: The 3x3 change of base matrix.
+    """    
     if all([len(arg)==2 for arg in locals().values()]):
         #arguments defined as trend & plunge
         v1 = gkp.Vector.from_trendplunge(*new_x)
@@ -574,7 +792,18 @@ def change_base_matrix(new_x, new_y, new_z):
     
     return change_base_matrix
 
-def change_base(points, new_x, new_y, new_z):
+def change_base(points: ArrayLike, new_x: Union[Tuple, List, ArrayLike, gkp.Vector], new_y: Union[Tuple, List, ArrayLike, gkp.Vector], new_z: Union[Tuple, List, ArrayLike, gkp.Vector]) -> np.ndarray:
+    """Applies a change of base to a set of points.
+
+    Args:
+        points (ArrayLike): The input points.
+        new_x (Union[Tuple, List, ArrayLike, gkp.Vector]): The new x base.
+        new_y (Union[Tuple, List, ArrayLike, gkp.Vector]): The new y base.
+        new_z (Union[Tuple, List, ArrayLike, gkp.Vector]): The new z base.
+
+    Returns:
+        np.ndarray: The points in the new base.
+    """
     change_base_mat = change_base_matrix(new_x, new_y, new_z)
     try:
         new_base_pts = change_base_mat @ points  
@@ -584,28 +813,21 @@ def change_base(points, new_x, new_y, new_z):
     return new_base_pts
 
 
-def rotate(points, new_x, new_y, new_z):
-    '''
+def rotate(points: ArrayLike, new_x: Union[Tuple, List, ArrayLike, gkp.Vector], new_y: Union[Tuple, List, ArrayLike, gkp.Vector], new_z: Union[Tuple, List, ArrayLike, gkp.Vector]) -> np.ndarray:
+    """Rotates points using a rotation matrix defined by new base vectors.
+
     multiplication needs to be  rot_matrix @ points
-    
     with rot_matrix = 3x3 and points = 3x1
 
-    Parameters
-    ----------
-    points : list or array
-    new_x : tuple or Vector
-        (trend, plunge) or (vx, vy, vz)
-    new_y : tuple or Vector
-        (trend, plunge) or (vx, vy, vz)
-    new_z : tuple or Vector
-        (trend, plunge) or (vx, vy, vz)
+    Args:
+        points (ArrayLike): List or array of points.
+        new_x (Union[Tuple, List, ArrayLike, gkp.Vector]): (trend, plunge) or (vx, vy, vz).
+        new_y (Union[Tuple, List, ArrayLike, gkp.Vector]): (trend, plunge) or (vx, vy, vz).
+        new_z (Union[Tuple, List, ArrayLike, gkp.Vector]): (trend, plunge) or (vx, vy, vz).
 
-    Returns
-    -------
-    rotated_pts : TYPE
-        DESCRIPTION.
-
-    '''
+    Returns:
+        np.ndarray: The rotated points.
+    """
     rot_matrix = rotation_matrix(new_x, new_y, new_z)    
     # breakpoint()
     try:
@@ -621,7 +843,18 @@ try:
 except AttributeError:
     pass
 
-def format_point_collection(points:PointCollection)->np.ndarray:
+def format_point_collection(points: PointCollection) -> np.ndarray:
+    """Formats a collection of points into a numpy array.
+
+    Args:
+        points (PointCollection): The collection of points.
+
+    Returns:
+        np.ndarray: The formatted numpy array of coordinates.
+
+    Raises:
+        ValueError: If the size of the array representing xy(z) is not 2 or 3 columns.
+    """
     if isinstance(points, MultiPoint):
         points=[point for point in points.geoms]
     elif isinstance(points, (list, tuple)):
@@ -637,15 +870,34 @@ def format_point_collection(points:PointCollection)->np.ndarray:
             points = np.array(array)
     return points
 
-def mask_points_inside_perimeter(points:PointCollection,
-                                 perimeter:shapely.Polygon)->list:
+def mask_points_inside_perimeter(points: PointCollection,
+                                 perimeter: shapely.Polygon) -> List[bool]:
+    """Creates a boolean mask for points inside a given perimeter polygon.
+
+    Args:
+        points (PointCollection): The collection of points to check.
+        perimeter (shapely.Polygon): The polygon perimeter.
+
+    Returns:
+        List[bool]: A mask indicating which points are inside the perimeter.
+    """
     points_arr = format_point_collection(points)
     point_geoms = shapely.points(points_arr)
     mask = perimeter.geometry.values.covers(point_geoms)
     return mask
 
-def mask_with_polygon(datarray:xr.DataArray, polygon:shapely.Polygon,
-                      where:Literal['inside', 'outside'])->np.ndarray:
+def mask_with_polygon(datarray: xr.DataArray, polygon: shapely.Polygon,
+                      where: Literal['inside', 'outside']) -> np.ndarray:
+    """Masks an xarray DataArray with a shapely polygon.
+
+    Args:
+        datarray (xr.DataArray): The DataArray to mask.
+        polygon (shapely.Polygon): The polygon to use as a mask.
+        where (Literal['inside', 'outside']): Whether to mask 'inside' or 'outside' the polygon.
+
+    Returns:
+        np.ndarray: The resulting boolean mask array.
+    """
     X,Y = np.meshgrid(datarray.x, datarray.y)
     path = mplpath.Path([(x,y) for x,y in zip(*polygon.exterior.coords.xy)])
     flags = path.contains_points(np.hstack((X.flatten()[:,np.newaxis],
@@ -663,59 +915,116 @@ def mask_with_polygon(datarray:xr.DataArray, polygon:shapely.Polygon,
 @pd.api.extensions.register_dataframe_accessor('pcloud')    
 class Pcloud:
     
-    def __init__(self, pandas_dataframe, **kwargs):
-        '''        
-        Accessor grouping methods to work with a DataFRame containing data on 
-        point clouds.   
-        
-        It assumes there are columns called x, y, and z
-        
-        x, y, and z correspond to a ENU system
+    def __init__(self, pandas_dataframe: pd.DataFrame, **kwargs):
+        """Initializes the Pcloud accessor for a pandas DataFrame.
 
-        '''
+        Accessor grouping methods to work with a DataFrame containing data on 
+        point clouds.   
+        It assumes there are columns called x, y, and z.
+        x, y, and z correspond to a ENU system.
+
+        Args:
+            pandas_dataframe (pd.DataFrame): The DataFrame to attach to.
+            **kwargs: Additional keyword arguments.
+        """
         
         self.data = pandas_dataframe        
         
 
-    def __repr__(self):        
-          return self.data.__repr__()
+    def __repr__(self) -> str:
+        """Returns the string representation of the underlying DataFrame.
+
+        Returns:
+            str: The string representation.
+        """
+        return self.data.__repr__()
       
       
-    def load_file(self, *args, **kwargs):
-          
-          df = pd.read_csv(args[0])
-          
-          self.data = df
+    def load_file(self, *args, **kwargs) -> None:
+        """Loads a point cloud from a CSV file into the DataFrame.
+
+        Args:
+            *args: Positional arguments, expecting the filepath as the first argument.
+            **kwargs: Additional keyword arguments for pandas read_csv.
+        """
+        df = pd.read_csv(args[0])
+        self.data = df
           
     
-    def x(self):
+    def x(self) -> pd.Series:
+        """Gets the x coordinates.
+
+        Returns:
+            pd.Series: The x coordinates.
+        """
         x = self.data.x
         return x
     
-    def y(self):
+    def y(self) -> pd.Series:
+        """Gets the y coordinates.
+
+        Returns:
+            pd.Series: The y coordinates.
+        """
         y = self.data.y
         return y
     
-    def z(self):
+    def z(self) -> pd.Series:
+        """Gets the z coordinates.
+
+        Returns:
+            pd.Series: The z coordinates.
+        """
         z = self.data.z
         return z
     
-    def coord_columns(self):
+    def coord_columns(self) -> List[str]:
+        """Gets the coordinate column names.
+
+        Returns:
+            List[str]: A list of coordinate column names.
+        """
         coords_columns = [name for name in self.coord_names.values()]
         return coords_columns
         
-    def coordinates(self):
+    def coordinates(self) -> pd.DataFrame:
+        """Gets the DataFrame containing only x, y, and z coordinates.
+
+        Returns:
+            pd.DataFrame: The coordinates DataFrame.
+        """
         return self.data.loc[:,('x','y','z')]
         
-    def coord_values(self):
+    def coord_values(self) -> np.ndarray:
+        """Gets the coordinate values as a numpy array.
+
+        Returns:
+            np.ndarray: The coordinates array.
+        """
         return self.coordinates().values
     
-    def centroid(self, func='mean'):
+    def centroid(self, func: str = 'mean') -> pd.Series:
+        """Calculates the centroid of the point cloud.
+
+        Args:
+            func (str, optional): The function to use, e.g., 'mean'. Defaults to 'mean'.
+
+        Returns:
+            pd.Series: The centroid coordinates.
+        """
         centroid = getattr(self.coordinates(), func)(axis=0)
         return centroid
     
     
-    def least_squares(self, **kwargs):
+    def least_squares(self, **kwargs) -> Tuple[np.ndarray, np.ndarray, int, np.ndarray]:
+        """Calculates the least squares fit of a plane to the point cloud.
+
+        Args:
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, int, np.ndarray]: The fit, residual, rank, and singular values.
+        """
         points = self.coord_values()
         A = np.array(np.hstack((points[:,0:2], np.ones((points.shape[0],1)))))
         b = np.array(points[:,2].reshape((points.shape[0],1)))
@@ -723,9 +1032,19 @@ class Pcloud:
         return fit, residual, rank, singular_values
         
         
-    def fit_plane_to_points(self, **kwargs):
-        """
-        points is an array nx3 where each row is a point
+    def fit_plane_to_points(self, **kwargs) -> Tuple[gkp.Plane, float]:
+        """Fits a plane to the points using PCA or least squares.
+
+        points is an array nx3 where each row is a point.
+
+        Args:
+            **kwargs: Keyword arguments, including 'method' ('pca' or 'least_squares').
+
+        Returns:
+            Tuple[gkp.Plane, float]: The fitted plane and the residual.
+
+        Raises:
+            ValueError: If there are not enough points (less than 3) to get a plane.
         """
         method = kwargs.pop('method', 'pca')
         points = self.coord_values()
@@ -762,7 +1081,18 @@ class Pcloud:
         
         return plane, residual
 
-    def project_points_on_plane(self, plane, **kwargs):
+    def project_points_on_plane(self, plane: gkp.Plane, **kwargs) -> np.ndarray:
+        """Projects the point cloud onto a given plane.
+
+        Centers the cloud, projects it on the given plane, and returns the new XYZ coordinates.
+
+        Args:
+            plane (gkp.Plane): The plane onto which to project the points.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            np.ndarray: The projected coordinates.
+        """
         #projects the points into a plane with translation
         
         #center the cloud        
@@ -773,10 +1103,17 @@ class Pcloud:
         
         return new_xyz     
             
-    def convex_hull_3D(self, plane=None, **kwargs):  
-        '''
-        finds a convex hull marking the perimeter of the point cloud
-        '''
+    def convex_hull_3D(self, plane: Optional[gkp.Plane] = None, **kwargs) -> np.ndarray:
+        """Finds a convex hull marking the perimeter of the point cloud.
+
+        Args:
+            plane (Optional[gkp.Plane], optional): A plane that fits the point cloud. 
+                If not given, it uses PCA. Defaults to None.
+            **kwargs: Additional arguments, such as 'spline' (bool) for smoothing.
+
+        Returns:
+            np.ndarray: The 3D coordinates of the convex hull.
+        """
         spline = kwargs.pop('spline', True)
         #get plane that fits the point cloud.
         #not dependant on location, only the orientation counts
@@ -840,8 +1177,16 @@ class Pcloud:
     #     return new_xyz        
         
     
-    def interpolated_grid(self, num_pts=100, plane=None):
-        
+    def interpolated_grid(self, num_pts: int = 100, plane: Optional[gkp.Plane] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Interpolates points onto a regular grid on a specified plane.
+
+        Args:
+            num_pts (int, optional): The number of points for the grid. Defaults to 100.
+            plane (Optional[gkp.Plane], optional): The plane to project to. Defaults to None.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, np.ndarray]: The X, Y, and Z grids.
+        """
         if plane is None:
             pl, _ = self.fit_plane_to_points(method='pca')
         else:
@@ -868,7 +1213,15 @@ class Pcloud:
        
         return new_grid[:,:,0], new_grid[:,:,1], new_grid[:,:,2]
     
-    def mesh_points(self, **kwargs):
+    def mesh_points(self, **kwargs) -> tri.Triangulation:
+        """Creates a mesh triangulation of the points projected on a plane.
+
+        Args:
+            **kwargs: Additional keyword arguments, such as 'plane'.
+
+        Returns:
+            tri.Triangulation: The triangulation object.
+        """
         plane = kwargs.pop('plane', None)
         if plane is None:
             pl, _ = self.fit_plane_to_points(method='pca')
@@ -881,7 +1234,21 @@ class Pcloud:
         
         return triangulation
     
-    def fit_with_open3d(self, method='poisson', **kwargs):
+    def fit_with_open3d(self, method: str = 'poisson', **kwargs) -> "open3d.geometry.TriangleMesh":
+        """Fits a 3D surface to the point cloud using Open3D algorithms.
+
+        Algorithms available: 'poisson', 'ball_pivoting', 'alpha_shape'.
+
+        Args:
+            method (str, optional): The Open3D method to use. Defaults to 'poisson'.
+            **kwargs: Additional keyword arguments such as 'plane', 'radius_factor', 'alpha'.
+
+        Returns:
+            open3d.geometry.TriangleMesh: The reconstructed surface mesh.
+
+        Raises:
+            ValueError: If the open3d module is not installed.
+        """
         if not OPEN3D:
             raise ValueError("Module open3d needed to run this function")
         plane = kwargs.pop('plane', None)
@@ -993,7 +1360,17 @@ class Pcloud:
         # return vertices, triangles
         return final_mesh
     
-    def fit_with_weighted_avg(self, **kwargs):
+    def fit_with_weighted_avg(self, **kwargs) -> "open3d.geometry.TriangleMesh":
+        """Fits a surface to the point cloud using a weighted average technique.
+
+        Projects points on a plane, grids them, and computes Z values by weighted averaging.
+
+        Args:
+            **kwargs: Keyword arguments including 'plane', 'spacing', 'n_elements', and 'average_kwargs'.
+
+        Returns:
+            open3d.geometry.TriangleMesh: The resulting triangulated mesh.
+        """
         
         plane = kwargs.pop('plane', None)
         spacing = kwargs.pop('spacing', None)
@@ -1040,8 +1417,23 @@ class Pcloud:
     
         grid_in_hull = np.c_[grid[inside_hull], [0]*sum(inside_hull)]
         
-        def compute_weights(distances, closest_nelems=None,
-                    window_name=None, window_args=None, window_kwargs=None):
+        def compute_weights(distances: np.ndarray, closest_nelems: Optional[int] = None,
+                    window_name: Optional[str] = None, window_args: Optional[Tuple] = None, window_kwargs: Optional[dict] = None) -> np.ndarray:
+            """Computes distance-based weights for the averaging algorithm.
+
+            Args:
+                distances (np.ndarray): Array of distances to neighboring points.
+                closest_nelems (Optional[int], optional): Number of elements to consider. Defaults to None.
+                window_name (Optional[str], optional): The name of a scipy window function. Defaults to None.
+                window_args (Optional[Tuple], optional): Window arguments. Defaults to None.
+                window_kwargs (Optional[dict], optional): Window keyword arguments. Defaults to None.
+
+            Returns:
+                np.ndarray: The computed weights.
+
+            Raises:
+                ValueError: If the open3d module is not installed.
+            """
             
             if not OPEN3D:
                 raise ValueError("Module open3d needed to run this function")
@@ -1107,12 +1499,28 @@ except AttributeError:
 
 @xr.register_dataarray_accessor('pgrid')
 class Pgrid:
-    #accessor to handle structured grids (regular grids with xyz + values)
-    def __init__(self, data_array):     
+    
+    def __init__(self, data_array: xr.DataArray):
+        """Accessor to handle structured grids (regular grids with xyz + values).
+
+        Args:
+            data_array (xr.DataArray): The xarray DataArray.
+        """
         self._obj = data_array
         
     @classmethod
-    def factory(cls, axes, origin, step, size):
+    def factory(cls, axes: gkp.Axes, origin: Tuple[float, float, float], step: Tuple[float, float, float], size: Tuple[int, int, int]) -> xr.DataArray:
+        """Creates a structured grid DataArray from basic parameters.
+
+        Args:
+            axes (gkp.Axes): The axes definition for orientation.
+            origin (Tuple[float, float, float]): The origin (x, y, z).
+            step (Tuple[float, float, float]): The spacing step in (x, y, z).
+            size (Tuple[int, int, int]): The number of points in (x, y, z).
+
+        Returns:
+            xr.DataArray: The generated DataArray.
+        """
         # xyz = gkp.Axes.xyz()
         
         coords_list=[np.arange(0, s7ep*s1ze, step=s7ep) for s7ep, s1ze in zip(step, size)]
@@ -1138,7 +1546,20 @@ class Pgrid:
         return darray
     
     @classmethod
-    def from_arrays(cls, x,y,values,*,z=None, force_structured:bool, **kwargs):
+    def from_arrays(cls, x: ArrayLike, y: ArrayLike, values: ArrayLike, *, z: Optional[ArrayLike] = None, force_structured: bool = False, **kwargs) -> xr.DataArray:
+        """Creates a Pgrid DataArray from coordinate arrays and values.
+
+        Args:
+            x (ArrayLike): The x coordinates.
+            y (ArrayLike): The y coordinates.
+            values (ArrayLike): The grid values.
+            z (Optional[ArrayLike], optional): The z coordinates. Defaults to None.
+            force_structured (bool, optional): Whether to force structured grid generation. Defaults to False.
+            **kwargs: Additional keyword arguments like 'nx', 'ny', 'nz'.
+
+        Returns:
+            xr.DataArray: The resulting DataArray.
+        """
         nx=kwargs.pop('nx',None)
         ny=kwargs.pop('ny',None)
         nz=kwargs.pop('nz',None)
@@ -1168,13 +1589,28 @@ class Pgrid:
         return darray
         
     @classmethod
-    def from_csv(cls,*,filepath:str,
-                 skip_header:int,
-                 column_mapping:dict=None,
-                 force_structured:bool,
-                 read_csv_kwargs:Optional[dict],
-                 convert_from_arrays_kwargs:Optional[dict],                 
-                 ):
+    def from_csv(cls, *, filepath: str,
+                 skip_header: int,
+                 column_mapping: Optional[dict] = None,
+                 force_structured: bool = False,
+                 read_csv_kwargs: Optional[dict] = None,
+                 convert_from_arrays_kwargs: Optional[dict] = None) -> xr.DataArray:
+        """Loads a Pgrid DataArray from a CSV file.
+
+        Args:
+            filepath (str): The path to the CSV file.
+            skip_header (int): Number of header lines to skip.
+            column_mapping (Optional[dict], optional): Mapping of column names. Defaults to None.
+            force_structured (bool, optional): Whether to force structured grid generation. Defaults to False.
+            read_csv_kwargs (Optional[dict], optional): Kwargs for read_csv. Defaults to None.
+            convert_from_arrays_kwargs (Optional[dict], optional): Kwargs for from_arrays. Defaults to None.
+
+        Returns:
+            xr.DataArray: The generated DataArray.
+        """
+        if read_csv_kwargs is None: read_csv_kwargs = {}
+        if convert_from_arrays_kwargs is None: convert_from_arrays_kwargs = {}
+        
         # breakpoint()
         x, y, z, values = read_csv(filepath=filepath, skip_header=skip_header,
                                    column_mapping=column_mapping, **read_csv_kwargs)
@@ -1188,8 +1624,17 @@ class Pgrid:
     
     
     def extract_data_along_path(self, *,                                      
-                                      path_geometry:pd.Series,
-                                      interp_kwargs:dict=None)->xr.DataArray:
+                                      path_geometry: pd.Series,
+                                      interp_kwargs: Optional[dict] = None) -> xr.DataArray:
+        """Extracts data along a defined 2D path geometry.
+
+        Args:
+            path_geometry (pd.Series): The geometry defining the path.
+            interp_kwargs (Optional[dict], optional): Arguments for interpolation. Defaults to None.
+
+        Returns:
+            xr.DataArray: A DataArray with extracted values along the path.
+        """
         if interp_kwargs is None:
             interp_kwargs = {}
         x = [pt.x for pt in path_geometry]
@@ -1221,7 +1666,15 @@ class Pgrid:
     
     
     
-    def to_pyvista_imagegrid(self):
+    def to_pyvista_imagegrid(self) -> Any:
+        """Converts the DataArray to a PyVista ImageData grid.
+
+        Returns:
+            Any (pyvista.ImageData): The PyVista image grid.
+
+        Raises:
+            ValueError: If the pyvista module is not installed.
+        """
         if not PYVISTA:
             raise ValueError("Module pyvista needed to run this function")
         darray = self._obj
@@ -1238,13 +1691,29 @@ class Pgrid:
         grid.point_data["values"] = darray.values.flatten(order="F")  # Assign values        
         return grid
     
-    def to_pyvista_structuredgrid(self):
+    def to_pyvista_structuredgrid(self) -> Any:
+        """Converts the DataArray to a PyVista StructuredGrid.
+
+        Returns:
+            Any (pyvista.StructuredGrid): The PyVista structured grid.
+        """
         image_grid=self._obj.pgrid.to_pyvista_imagegrid()
         struct_grid = image_grid.cast_to_structured_grid()
         return struct_grid
         
     
-    def plot_pyvista(self, **kwargs):
+    def plot_pyvista(self, **kwargs) -> Any:
+        """Plots the grid using PyVista.
+
+        Args:
+            **kwargs: Keyword arguments like 'plotter' and 'threshold'.
+
+        Returns:
+            Any (pyvista.Plotter): The active plotter object.
+
+        Raises:
+            ValueError: If the pyvista module is not installed.
+        """
         if not PYVISTA:
             raise ValueError("Module pyvista needed to run this function")
         plotter = kwargs.get('plotter', pyvista.Plotter())
@@ -1264,7 +1733,18 @@ class Pgrid:
                          show_edges=True, scalars="values")
         return plotter
     
-    def plot_matplotlib(self, ax=None):
+    def plot_matplotlib(self, ax: Any = None) -> Tuple[Any, Any]:
+        """Plots the grid using Matplotlib voxels.
+
+        Assumes the cells to fill have a float value different from np.nan
+        Assumes regular spacing in all 3 dimensions.
+
+        Args:
+            ax (Any, optional): The matplotlib axis. Defaults to None.
+
+        Returns:
+            Tuple[Any, Any]: The axis and the faces (voxels) object.
+        """
         #Assumes the cells to fill have a float value different from np.nan
         #Assumes regular spacing in all 3 dimensions
         if ax is None:
@@ -1288,14 +1768,32 @@ class Pgrid:
                           filled, facecolors=facecolors, edgecolors='k')
         return ax, faces
     
-    def replace_inside_polygon(self, polygon:shapely.Polygon, fill_value:float=np.nan):
+    def replace_inside_polygon(self, polygon: shapely.Polygon, fill_value: float = np.nan) -> xr.DataArray:
+        """Replaces values inside a polygon with a fill value.
+
+        Args:
+            polygon (shapely.Polygon): The masking polygon.
+            fill_value (float, optional): The value to use for filling. Defaults to np.nan.
+
+        Returns:
+            xr.DataArray: The modified DataArray.
+        """
         #True outside the polygon
         mask = mask_with_polygon(self._obj, polygon, where='outside')
         mask = mask.reshape(self._obj.shape[-2:])
         #Keep True values (outside polygon) and replace those inside
         return self._obj.where(mask, fill_value)
         
-    def replace_outside_polygon(self, polygon:shapely.Polygon, fill_value:float=np.nan):
+    def replace_outside_polygon(self, polygon: shapely.Polygon, fill_value: float = np.nan) -> xr.DataArray:
+        """Replaces values outside a polygon with a fill value.
+
+        Args:
+            polygon (shapely.Polygon): The masking polygon.
+            fill_value (float, optional): The value to use for filling. Defaults to np.nan.
+
+        Returns:
+            xr.DataArray: The modified DataArray.
+        """
         #True inside the polygon
         mask = mask_with_polygon(self._obj, polygon, where='inside')
         mask = mask.reshape(self._obj.shape[-2:])
@@ -1303,9 +1801,19 @@ class Pgrid:
         return self._obj.where(mask, fill_value)
         
         
-    def find_isosurface(self, *,threshold_value:float,                                
-                                    mode:Literal['first','last'],
-                                    z_mode:Literal['elevation', 'depth']):
+    def find_isosurface(self, *, threshold_value: float,                                
+                                    mode: Literal['first','last'],
+                                    z_mode: Literal['elevation', 'depth']) -> xr.DataArray:
+        """Finds the z-values (isosurface) at a specific threshold value.
+
+        Args:
+            threshold_value (float): The threshold value.
+            mode (Literal['first', 'last']): Whether to find the first or last crossing.
+            z_mode (Literal['elevation', 'depth']): The direction of the z-axis.
+
+        Returns:
+            xr.DataArray: A DataArray containing the z-values for the isosurface.
+        """
         
         idx=self.find_idx_at_threshold(threshold_value=threshold_value,
                                         mode=mode, z_mode=z_mode)    
@@ -1313,9 +1821,19 @@ class Pgrid:
         return z_values
     
     
-    def find_idx_at_threshold(self, *,threshold_value:float,                                
-                                    mode:Literal['first','last'],
-                                    z_mode:Literal['elevation', 'depth'])->np.array:
+    def find_idx_at_threshold(self, *, threshold_value: float,                                
+                                    mode: Literal['first','last'],
+                                    z_mode: Literal['elevation', 'depth']) -> np.ndarray:
+        """Finds the vertical index where the value crosses a threshold.
+
+        Args:
+            threshold_value (float): The threshold value.
+            mode (Literal['first', 'last']): Whether to find the first or last crossing.
+            z_mode (Literal['elevation', 'depth']): The direction of the z-axis.
+
+        Returns:
+            np.ndarray: An array of indices corresponding to the threshold crossing.
+        """
         
         #apply threshold to DataArray
         # mask_crossings = ant_darray.data >= threshold_value # Boolean mask of threshold crossings
@@ -1374,8 +1892,17 @@ class Pgrid:
         return idx.data
     
     def interpolate_to_find_values(self, *,
-                                   idx:xr.DataArray,
-                                   threshold_value:float):
+                                   idx: xr.DataArray,
+                                   threshold_value: float) -> xr.DataArray:
+        """Interpolates values to find a more accurate depth for a threshold value.
+
+        Args:
+            idx (xr.DataArray): The array of integer indices.
+            threshold_value (float): The threshold value.
+
+        Returns:
+            xr.DataArray: A DataArray containing the interpolated z-values.
+        """
         #index of the vertical dimension
         z_idx = self._obj.dims.index('z')
         #Interpolates to find a more aqurate depth for the threshold value
@@ -1390,7 +1917,18 @@ class Pgrid:
 
 
 
-def structured_data_to_grid(x,y,values, z=None):
+def structured_data_to_grid(x: ArrayLike, y: ArrayLike, values: ArrayLike, z: Optional[ArrayLike] = None) -> xr.DataArray:
+    """Converts structured arrays to a regular DataArray grid.
+
+    Args:
+        x (ArrayLike): The x coordinates.
+        y (ArrayLike): The y coordinates.
+        values (ArrayLike): The data values.
+        z (Optional[ArrayLike], optional): The z coordinates. Defaults to None.
+
+    Returns:
+        xr.DataArray: The resulting regular grid DataArray.
+    """
     if z is not None:
         #3D case
         # breakpoint()
@@ -1426,12 +1964,21 @@ def structured_data_to_grid(x,y,values, z=None):
                                       ('x', x_unique)])
     return darray
 
-def incomplete_structured_data_to_grid(x,y,values, z=None):
-    '''
-    The original grid is structured but the input values do not include the nan
-    values that complete the grid
+def incomplete_structured_data_to_grid(x: ArrayLike, y: ArrayLike, values: ArrayLike, z: Optional[ArrayLike] = None) -> xr.DataArray:
+    """Creates a grid from incomplete structured data.
     
-    '''
+    The original grid is structured but the input values do not include the nan
+    values that complete the grid.
+
+    Args:
+        x (ArrayLike): The x coordinates.
+        y (ArrayLike): The y coordinates.
+        values (ArrayLike): The data values.
+        z (Optional[ArrayLike], optional): The z coordinates. Defaults to None.
+
+    Returns:
+        xr.DataArray: The resulting grid DataArray.
+    """
     if z is not None:
         #3D case
         x_unique = np.unique(x)
@@ -1470,8 +2017,23 @@ def incomplete_structured_data_to_grid(x,y,values, z=None):
         
     return darray
 
-def non_structured_data_to_grid(x,y,values,z=None, nx=100, ny=100, nz=100,
-                                **kwargs):
+def non_structured_data_to_grid(x: ArrayLike, y: ArrayLike, values: ArrayLike, z: Optional[ArrayLike] = None, nx: int = 100, ny: int = 100, nz: int = 100,
+                                **kwargs) -> xr.DataArray:
+    """Interpolates non-structured data onto a regular grid.
+
+    Args:
+        x (ArrayLike): The x coordinates.
+        y (ArrayLike): The y coordinates.
+        values (ArrayLike): The data values.
+        z (Optional[ArrayLike], optional): The z coordinates. Defaults to None.
+        nx (int, optional): Grid points in x. Defaults to 100.
+        ny (int, optional): Grid points in y. Defaults to 100.
+        nz (int, optional): Grid points in z. Defaults to 100.
+        **kwargs: Additional interpolation keyword arguments.
+
+    Returns:
+        xr.DataArray: The interpolated grid DataArray.
+    """
     # breakpoint()
     if z is not None:
         #3D case
@@ -1507,12 +2069,24 @@ def non_structured_data_to_grid(x,y,values,z=None, nx=100, ny=100, nz=100,
 #     columns=re.split('\W+', headerline)
 #     breakpoint()
 
-def read_csv(*,filepath: str,
+def read_csv(*, filepath: str,
              column_mapping: dict,
-             **kwargs)->tuple: 
-    '''
+             **kwargs) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]: 
+    """Reads x, y, z, and values from a CSV file.
+
     column_mapping={'x':0,'y':1,'z':2,'values':3}
-    '''       
+
+    Args:
+        filepath (str): Path to the CSV file.
+        column_mapping (dict): Dictionary mapping variable names to column indices.
+        **kwargs: Additional arguments for np.genfromtxt.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], np.ndarray]: Arrays of x, y, z, and values.
+
+    Raises:
+        IndexError: If columns are missing or delimiter is incorrect.
+    """       
     # breakpoint()
     arr=np.genfromtxt(filepath, **kwargs)
     try:
@@ -1525,20 +2099,28 @@ def read_csv(*,filepath: str,
     try:
         z=arr[:,column_mapping['z']]
     except:
-        pass
+        z=None
     return x, y, z, values
 
-def describe_csv(filepath, **kwargs):
-    x, y, z, values = read_csv(filepath, **kwargs)
-    nx, ny, nz = len(np.unique(x)), len(np.unique(y)), len(np.unique(z))
+def describe_csv(filepath: str, **kwargs) -> None:
+    """Prints a description of the coordinate arrays read from a CSV file.
+
+    Args:
+        filepath (str): Path to the CSV file.
+        **kwargs: Additional arguments passed to read_csv.
+    """
+    x, y, z, values = read_csv(filepath=filepath, **kwargs)
+    nx, ny, nz = len(np.unique(x)), len(np.unique(y)), 1 if z is None else len(np.unique(z))
     print(f'Length of array = {len(x)}')
     print(f'nx*ny*nz = {nx*ny*nz}')
     print(f'sorted x = {np.sort(np.unique(x))}')
     print(f'sorted y = {np.sort(np.unique(y))}')
-    print(f'sorted z = {np.sort(np.unique(z))}')
+    if z is not None:
+        print(f'sorted z = {np.sort(np.unique(z))}')
     print(f'spacing x = {np.diff(np.sort(np.unique(x)))}')
     print(f'spacing y = {np.diff(np.sort(np.unique(y)))}')
-    print(f'spacing z = {np.diff(np.sort(np.unique(z)))}')       
+    if z is not None:
+        print(f'spacing z = {np.diff(np.sort(np.unique(z)))}')       
 #%% MAIN
 if __name__ == '__main__':
     
