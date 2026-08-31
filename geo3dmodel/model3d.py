@@ -1,3 +1,4 @@
+from __future__ import annotations
  # -*- coding: utf-8 -*-
 """
 Created on Tue Oct 12 07:36:15 2021
@@ -40,19 +41,19 @@ import skimage
 try:
     import open3d
     OPEN3D=True
-except ModuleNotFoundError:
+except ImportError:
     OPEN3D=False
 
 try:
     import trimesh
     TRIMESH=True
-except ModuleNotFoundError:
+except ImportError:
     TRIMESH=False
 
 try:
     import pyvista
     PYVISTA=True
-except ModuleNotFoundError:
+except ImportError:
     PYVISTA=False
 
 import geokitpy as gkp
@@ -248,7 +249,7 @@ def build_surface_from_polylines(line1:shapely.LineString,
         all_pts = np.vstack([pts1, pts2])
         x, y, z = all_pts[:, 0], all_pts[:, 1], all_pts[:, 2]
     except IndexError:
-        breakpoint()
+        pass
     
     # Initialize index arrays for the mesh triangles
     i_idx, j_idx, k_idx = [], [], []
@@ -518,7 +519,7 @@ def orientations_to_pcloud(strikes, dips, centers, radius=1, num_sides=15, **kwa
     try:
         arr = np.concatenate(coords_lst, axis=0)
     except ValueError:
-        breakpoint()
+        pass
         
     df = pd.DataFrame(arr, columns=['x','y','z'])
     return df
@@ -710,7 +711,7 @@ class Pcloud:
         return self.coordinates().values
     
     def centroid(self, func='mean'):
-        centroid = eval(f'self.coordinates().{func}(axis=0)')
+        centroid = getattr(self.coordinates(), func)(axis=0)
         return centroid
     
     
@@ -1052,7 +1053,7 @@ class Pcloud:
                     closest_nelems = len(distances)
                 else:
                     window_size=2*closest_nelems
-                window=eval(f'windows.{window_name}(window_size, *window_args, **window_kwargs)')
+                window=getattr(windows, window_name)(window_size, *window_args, **window_kwargs)
                 #take only half of the window
                 weights=window[window_size//2:]
             else:
@@ -1126,7 +1127,7 @@ class Pgrid:
             xv, yv, zv = np.meshgrid(*coords_list)   
             v=gkp.Vector(np.stack((xv,yv,zv), axis=-1))
         except:
-            breakpoint()
+            pass
         #rotation
         vr = v@rot_matrix
         
@@ -1274,7 +1275,7 @@ class Pgrid:
         darray_T = self._obj.transpose("x", "y", "z")
         
         #Coordinates must have one element less than the values
-        breakpoint()
+        # breakpoint()
         x = darray_T.x
         y = darray_T.y
         z = darray_T.z
@@ -1524,7 +1525,7 @@ def read_csv(*,filepath: str,
     try:
         z=arr[:,column_mapping['z']]
     except:
-        breakpoint()
+        pass
     return x, y, z, values
 
 def describe_csv(filepath, **kwargs):
