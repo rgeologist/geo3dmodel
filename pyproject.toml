@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geo3dmodel"
+version = "0.1.0"
+description = "A 3D modeling package for geosciences"
+dependencies = [
+    "pandas",
+    "numpy",
+    "plotly",
+    "shapely",
+    "xarray",
+    "matplotlib",
+    "scipy",
+    "scikit-learn",
+    "scikit-image",
+    "geokitpy"
+]
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["geo3dmodel*"]
