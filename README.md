@@ -1,13 +1,14 @@
 # Geo3DModel
 
-**Geo3DModel** is a robust and flexible 3D modeling package designed for geosciences. It provides a unified abstract interface alongside concrete implementations using powerful visualization libraries like **PyVista** and **Plotly**, allowing for seamless 3D data manipulation and rendering.
+**Geo3DModel** is a robust and flexible 3D modeling package designed for geosciences. It provides a core module to construct geological 3D objects, alongside concrete implementations using powerful visualization libraries like **PyVista** and **Plotly** to seamlessly plot them.
 
 ---
 
 ## 🌟 Features
 
+- **Core Modeling (`model3d.py`):** Allows you to build and manipulate 3D objects commonly used in geosciences.
 - **Abstract Base Engine:** A clean `Model3D_abstract` interface defining standard methods for 3D modeling.
-- **Multiple Visualization Backends:**
+- **Multiple Visualization Backends:** The Plotly and PyVista implementations allow you to easily plot and visualize the 3D objects you've built.
   - **PyVista (`model3d_pyvista`)**: High-performance, VTK-based 3D rendering for large and complex geological datasets.
   - **Plotly (`model3d_plotly`)**: Interactive, browser-based 3D visualizations ideal for web applications and notebooks.
 - **Extensive Tooling:** Built on top of a powerful scientific stack including `numpy`, `pandas`, `xarray`, `scipy`, `shapely`, and `scikit-image`.
@@ -63,10 +64,10 @@ The test suite gracefully skips backend-specific tests if the respective optiona
 
 ## 🛠️ Architecture
 
+- `geo3dmodel/model3d.py`: Core logic allowing you to build common 3D geoscience objects.
 - `geo3dmodel/model3d_abstract.py`: The abstract base class dictating the API contract.
-- `geo3dmodel/model3d_pyvista.py`: The concrete PyVista implementation.
-- `geo3dmodel/model3d_plotly.py`: The concrete Plotly implementation.
-- `geo3dmodel/model3d.py`: Core logic and integration.
+- `geo3dmodel/model3d_pyvista.py`: The concrete PyVista implementation for plotting.
+- `geo3dmodel/model3d_plotly.py`: The concrete Plotly implementation for plotting.
 
 ## 🤝 Contributing
 
