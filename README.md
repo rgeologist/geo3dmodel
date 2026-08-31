@@ -30,7 +30,15 @@ pip install .[dev]
 
 ## 🚀 Quick Start
 
-Here is a quick overview of how you can use the package depending on your preferred backend:
+Here is a quick overview of how you can use the package to build and visualize your data:
+
+### Building 3D Objects
+```python
+from geo3dmodel import model3d
+
+# Build a generic rectangular mesh
+vertices, faces = model3d.build_rectangular_mesh(...)
+```
 
 ### Using the PyVista Backend
 ```python
