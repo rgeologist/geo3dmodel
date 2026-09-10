@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: geo3dmodel
+Version: 0.1.0
+Summary: A 3D modeling package for geosciences
+Requires-Python: >=3.8
+Requires-Dist: pandas
+Requires-Dist: numpy
+Requires-Dist: plotly
+Requires-Dist: shapely
+Requires-Dist: xarray
+Requires-Dist: matplotlib
+Requires-Dist: scipy
+Requires-Dist: scikit-learn
+Requires-Dist: scikit-image
+Requires-Dist: geokitpy
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"

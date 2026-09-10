@@ -1,0 +1,13 @@
+pandas
+numpy
+plotly
+shapely
+xarray
+matplotlib
+scipy
+scikit-learn
+scikit-image
+geokitpy
+
+[dev]
+pytest

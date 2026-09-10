@@ -119,6 +119,47 @@ def rotate_flat_polygon_strike_dip(*, x: NDArray, y: NDArray, strike: float, dip
     new_coords = ((rot_mat @ coords)).T    
     return new_coords
 
+def build_disk_parallel_to_plane(*, plane:gkp.Plane,
+                                 center:tuple,
+                                 radius:float,
+                                 num_sides:int):
+    x,y = build_flat_disk_perimeter_xy(radius=radius, num_sides=num_sides)
+    x, y = x-center[0], y-center[1]
+    new_coords = rotate_flat_polygon_strike_dip(x=x, y=y, strike=plane.strike, dip=plane.dip)
+    return new_coords
+
+def generate_disks_around_path(*, path:pd.DataFrame,
+                               position_disks:Literal['start', 'middle', 'end'],
+                               radius_disks:ArrayLike,
+                               num_sides_disks:int)->list:
+    
+    path_coords = path.loc[:,['x','y','z']]
+    path_arr = path_coords.to_numpy()
+    planes = gkp.Vector.from_path(path_arr).view(gkp.Plane)
+    
+    match position_disks:
+        case 'start':
+            centers=path_arr[:-1,:]
+        case 'middle':
+            centers=path_arr[:-1,:]+planes/2.
+        case 'end':
+            centers=path_arr[1:,:]
+        case _:
+            raise ValueError('position_disks must be either '
+                             '"start, "middle" or "end". '
+                             f'{position_disks} was given')   
+    iterator = zip(planes, centers,
+                   itertools.repeat(radius_disks),
+                   itertools.repeat(num_sides_disks))
+    disks = [build_disk_parallel_to_plane(plane=pl,
+                                     center=center,
+                                     radius=rad,
+                                     num_sides=num_sides) for
+             pl, center, rad, num_sides in iterator]
+    return disks
+    
+
+
 def triangulate_perimeter(x: NDArray, y: NDArray) -> Tuple[tri.Triangulation, np.ndarray]:
     """Triangulates a perimeter defined by x and y coordinates.
 
