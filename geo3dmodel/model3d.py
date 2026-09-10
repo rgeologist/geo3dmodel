@@ -148,8 +148,20 @@ def generate_disks_around_path(*, path:pd.DataFrame,
             raise ValueError('position_disks must be either '
                              '"start, "middle" or "end". '
                              f'{position_disks} was given')   
+    radius_array = np.asarray(radius_disks)
+    if radius_array.ndim == 0:
+        radii = itertools.repeat(radius_array.item(), len(centers))
+    else:
+        if radius_array.size != len(centers):
+            raise ValueError(
+                'radius_disks must contain one radius per disk center; '
+                f'{radius_array.size} radii were provided for '
+                f'{len(centers)} centers'
+            )
+        radii = radius_array.flat
+
     iterator = zip(planes, centers,
-                   itertools.repeat(radius_disks),
+                   radii,
                    itertools.repeat(num_sides_disks))
     disks = [build_disk_parallel_to_plane(plane=pl,
                                      center=center,
