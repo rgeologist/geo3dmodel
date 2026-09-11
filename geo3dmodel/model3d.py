@@ -9,7 +9,7 @@ from os import PathLike
 from copy import copy
 import itertools
 import numbers
-from typing import Callable, Union, List, Tuple, Optional, Literal
+from typing import Callable, Union, List, Tuple, Optional, Literal, Sequence
 # import re
 # import logging
 import operator as py_operator
@@ -169,6 +169,107 @@ def generate_disks_around_path(*, path:pd.DataFrame,
                                      num_sides=num_sides) for
              pl, center, rad, num_sides in iterator]
     return disks
+
+
+def build_surface_from_disks(
+        disks: Sequence[ArrayLike],
+        *,
+        cap_ends: bool = False,
+        ) -> "trimesh.Trimesh":
+    """Build a triangulated surface by lofting ordered polygonal rings.
+
+    Each disk must contain the same number of perimeter points. Point ``j``
+    on one ring is connected to point ``j`` on the adjacent ring.
+
+    Args:
+        disks: Ordered disk perimeter coordinates. Each item must have shape
+            ``(n_points, 3)``.
+        cap_ends: If ``True``, add triangle-fan caps to the first and last
+            rings.
+
+    Returns:
+        A trimesh surface mesh containing the lofted lateral surface and,
+        optionally, end caps.
+
+    Raises:
+        ValueError: If the rings are empty, invalid, mismatched, or contain
+            non-finite coordinates.
+        ImportError: If trimesh is not installed.
+    """
+    if not TRIMESH:
+        raise ImportError("Module trimesh needed to run this function")
+    if len(disks) < 2:
+        raise ValueError("At least two disks are required")
+
+    rings = []
+    for disk in disks:
+        ring = np.asarray(disk, dtype=float)
+        if ring.ndim != 2 or ring.shape[1] != 3:
+            raise ValueError("Each disk must have shape (n_points, 3)")
+        if not np.isfinite(ring).all():
+            raise ValueError("Disk coordinates must be finite")
+
+        # Disk perimeters generated with np.linspace include the first point
+        # again at 2*pi; cyclic connectivity should not include that duplicate.
+        if len(ring) > 1 and np.allclose(ring[0], ring[-1]):
+            ring = ring[:-1]
+        if len(ring) < 3:
+            raise ValueError("Each disk must contain at least three points")
+        rings.append(ring)
+
+    n_points = len(rings[0])
+    if any(len(ring) != n_points for ring in rings[1:]):
+        raise ValueError("All disks must have the same number of points")
+
+    vertices = np.vstack(rings)
+    ring_centers = np.asarray([ring.mean(axis=0) for ring in rings])
+    faces = []
+
+    def add_oriented_face(a: int, b: int, c: int, radial: np.ndarray) -> None:
+        triangle = vertices[[a, b, c]]
+        normal = np.cross(triangle[1] - triangle[0],
+                          triangle[2] - triangle[0])
+        if np.linalg.norm(normal) == 0:
+            raise ValueError("Disks produce a degenerate triangle")
+        if np.dot(normal, radial) < 0:
+            faces.append([a, c, b])
+        else:
+            faces.append([a, b, c])
+
+    for ring_index in range(len(rings) - 1):
+        next_ring_index = ring_index + 1
+        for point_index in range(n_points):
+            next_point_index = (point_index + 1) % n_points
+            current = ring_index * n_points + point_index
+            current_next = ring_index * n_points + next_point_index
+            following = next_ring_index * n_points + point_index
+            following_next = next_ring_index * n_points + next_point_index
+            radial = (
+                (vertices[current] + vertices[current_next]) / 2
+                - ring_centers[ring_index]
+            )
+
+            add_oriented_face(current, current_next, following, radial)
+            add_oriented_face(current_next, following_next, following, radial)
+
+    if cap_ends:
+        for ring_index, reverse in ((0, True), (len(rings) - 1, False)):
+            center_index = len(vertices)
+            vertices = np.vstack((vertices, ring_centers[ring_index]))
+            for point_index in range(n_points):
+                next_point_index = (point_index + 1) % n_points
+                point = ring_index * n_points + point_index
+                point_next = ring_index * n_points + next_point_index
+                face = [center_index, point_next, point] if reverse else [
+                    center_index, point, point_next
+                ]
+                faces.append(face)
+
+    return trimesh.Trimesh(
+        vertices=vertices,
+        faces=np.asarray(faces, dtype=int),
+        process=False,
+    )
     
 
 
