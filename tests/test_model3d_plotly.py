@@ -53,6 +53,17 @@ class TestModel3DPlotly(unittest.TestCase):
         self.assertEqual(len(self.model.fig.data), 0)
 
     @unittest.skipIf(not HAS_PLOTLY or not HAS_MODEL3D, "Missing plotly or model3d_plotly")
+    def test_add_triangulated_surface(self):
+        from geo3dmodel.model3d import Trimesh3d
+        mesh = Trimesh3d(
+            vertices=np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]]),
+            faces=np.array([[0, 1, 2]])
+        )
+        self.model.add_triangulated_surface(mesh)
+        self.assertEqual(len(self.model.traces), 1)
+        self.assertIsInstance(self.model.traces[0], go.Mesh3d)
+
+    @unittest.skipIf(not HAS_PLOTLY or not HAS_MODEL3D, "Missing plotly or model3d_plotly")
     def test_templates(self):
         pv_template = self.model.paraview_template()
         self.assertIsNotNone(pv_template)

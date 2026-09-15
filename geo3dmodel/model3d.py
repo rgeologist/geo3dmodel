@@ -9,10 +9,12 @@ from os import PathLike
 from copy import copy
 import itertools
 import numbers
-from typing import Callable, Union, List, Tuple, Optional, Literal, Sequence
+from typing import (Callable, Union, List, Tuple,
+                    Optional, Literal, Sequence, Any)
 # import re
 # import logging
 import operator as py_operator
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray, ArrayLike
@@ -45,12 +47,6 @@ except ImportError:
     OPEN3D=False
 
 try:
-    import trimesh
-    TRIMESH=True
-except ImportError:
-    TRIMESH=False
-
-try:
     import pyvista
     PYVISTA=True
 except ImportError:
@@ -60,6 +56,17 @@ import geokitpy as gkp
 
 PointCollection = Union[List[Point], Tuple[Point, ...],
                         MultiPoint, np.ndarray, pd.DataFrame]
+
+@dataclass
+class Trimesh3d:
+    """Dataclass container for 3D surface vertices and faces."""
+    vertices: np.ndarray
+    faces: np.ndarray
+
+    def __post_init__(self) -> None:
+        self.vertices = np.asarray(self.vertices)
+        self.faces = np.asarray(self.faces)
+
 
 def check_strike_dip(strike: float, dip: float) -> None:
     """Checks if the provided strike and dip are valid numbers.
@@ -123,32 +130,55 @@ def build_disk_parallel_to_plane(*, plane:gkp.Plane,
                                  center:tuple,
                                  radius:float,
                                  num_sides:int):
-    x,y = build_flat_disk_perimeter_xy(radius=radius, num_sides=num_sides)
-    x, y = x-center[0], y-center[1]
+    x,y = build_flat_disk_perimeter_xy(radius=radius, num_sides=num_sides)        
     new_coords = rotate_flat_polygon_strike_dip(x=x, y=y, strike=plane.strike, dip=plane.dip)
+    # breakpoint()
+    new_coords[:,0] += center[0]
+    new_coords[:,1] += center[1]
+    new_coords[:,2] += center[2]
     return new_coords
 
-def generate_disks_around_path(*, path:pd.DataFrame,
-                               position_disks:Literal['start', 'middle', 'end'],
-                               radius_disks:ArrayLike,
-                               num_sides_disks:int)->list:
+@dataclass
+class CylinderAlongPath:
+    position_disks:Literal['start', 'middle', 'end', 'end-to-end']
+    radius_disks:ArrayLike
+    num_sides_disks:int
+    strike_disks:ArrayLike|None=None
+    dip_disks:ArrayLike|None=None
+    path:pd.DataFrame|None=None
+    cap_ends: bool = False
+
+def generate_disks_around_path(cylinder:CylinderAlongPath)->list:
+    cyl=cylinder
     
-    path_coords = path.loc[:,['x','y','z']]
+    path_coords = cyl.path.loc[:,['x','y','z']]
     path_arr = path_coords.to_numpy()
-    planes = gkp.Vector.from_path(path_arr).view(gkp.Plane)
+    if (cylinder.strike_disks is not None) & (cylinder.dip_disks is not None):
+        if not (np.asarray(cylinder.strike_disks).shape==np.asarray(cylinder.dip_disks).shape):
+            raise ValueError("Input strike and dip must have the same length")
+        planes = gkp.Plane(cylinder.strike_disks, cylinder.dip_disks)
+    else:
+        planes = gkp.Vector.from_path(path_arr).view(gkp.Plane)
     
-    match position_disks:
+    match cyl.position_disks:
         case 'start':
             centers=path_arr[:-1,:]
         case 'middle':
             centers=path_arr[:-1,:]+planes/2.
         case 'end':
             centers=path_arr[1:,:]
+        case 'end-to-end':
+            centers = path_arr
+            planes= np.append(planes,
+                              planes[-1,:][np.newaxis],
+                              axis=0).view(gkp.Plane)
+            
+                
         case _:
             raise ValueError('position_disks must be either '
                              '"start, "middle" or "end". '
-                             f'{position_disks} was given')   
-    radius_array = np.asarray(radius_disks)
+                             f'{cyl.position_disks} was given')   
+    radius_array = np.asarray(cyl.radius_disks)
     if radius_array.ndim == 0:
         radii = itertools.repeat(radius_array.item(), len(centers))
     else:
@@ -160,9 +190,11 @@ def generate_disks_around_path(*, path:pd.DataFrame,
             )
         radii = radius_array.flat
 
-    iterator = zip(planes, centers,
+    iterator = zip(np.tile(planes,(len(centers),1)),
+                   centers,
                    radii,
-                   itertools.repeat(num_sides_disks))
+                   itertools.repeat(cyl.num_sides_disks, len(centers)))
+    # breakpoint()
     disks = [build_disk_parallel_to_plane(plane=pl,
                                      center=center,
                                      radius=rad,
@@ -175,7 +207,7 @@ def build_surface_from_disks(
         disks: Sequence[ArrayLike],
         *,
         cap_ends: bool = False,
-        ) -> "trimesh.Trimesh":
+        ) -> Trimesh3d:
     """Build a triangulated surface by lofting ordered polygonal rings.
 
     Each disk must contain the same number of perimeter points. Point ``j``
@@ -188,16 +220,13 @@ def build_surface_from_disks(
             rings.
 
     Returns:
-        A trimesh surface mesh containing the lofted lateral surface and,
+        Trimesh3d: A triangulated surface mesh containing the lofted lateral surface and,
         optionally, end caps.
 
     Raises:
         ValueError: If the rings are empty, invalid, mismatched, or contain
             non-finite coordinates.
-        ImportError: If trimesh is not installed.
     """
-    if not TRIMESH:
-        raise ImportError("Module trimesh needed to run this function")
     if len(disks) < 2:
         raise ValueError("At least two disks are required")
 
@@ -224,6 +253,8 @@ def build_surface_from_disks(
     vertices = np.vstack(rings)
     ring_centers = np.asarray([ring.mean(axis=0) for ring in rings])
     faces = []
+    
+    
 
     def add_oriented_face(a: int, b: int, c: int, radial: np.ndarray) -> None:
         triangle = vertices[[a, b, c]]
@@ -265,13 +296,25 @@ def build_surface_from_disks(
                 ]
                 faces.append(face)
 
-    return trimesh.Trimesh(
+    return Trimesh3d(
         vertices=vertices,
         faces=np.asarray(faces, dtype=int),
-        process=False,
     )
     
-
+def build_cylinder_around_path(cylinder:CylinderAlongPath,
+                               )->Trimesh3d:
+    
+    rings = generate_disks_around_path(cylinder)
+    
+    cylinder_trimesh = build_surface_from_disks(
+            rings,
+            cap_ends=cylinder.cap_ends,
+            )  
+  
+    
+    return cylinder_trimesh    
+    
+    
 
 def triangulate_perimeter(x: NDArray, y: NDArray) -> Tuple[tri.Triangulation, np.ndarray]:
     """Triangulates a perimeter defined by x and y coordinates.
@@ -442,7 +485,7 @@ def build_vertical_surface(surface_path: shapely.Geometry,
                            max_segment_length: float = 100,
                            xsection_top: float = 900,
                            xsection_bottom: float = -4000,
-                           ) -> "trimesh.Trimesh":
+                           ) -> Trimesh3d:
     """Builds a vertical 3D surface (mesh) by extruding a 2D path.
 
     Args:
@@ -452,13 +495,11 @@ def build_vertical_surface(surface_path: shapely.Geometry,
         xsection_bottom (float, optional): The bottom Z elevation. Defaults to -4000.
 
     Returns:
-        trimesh.Trimesh: The resulting vertical surface mesh.
+        Trimesh3d: The resulting vertical surface mesh.
         
     Raises:
-        ValueError: If trimesh is not available or geometry type is unsupported.
+        ValueError: If geometry type is unsupported.
     """
-    if not TRIMESH:
-        raise ValueError("Module trimesh needed to run this function")
     #Read and format data
     if isinstance(surface_path, shapely.MultiPoint):
         path_ls = (shapely.LineString(surface_path.geoms)
@@ -491,7 +532,7 @@ def build_vertical_surface(surface_path: shapely.Geometry,
         faces.append([i + 1, i + 1 + n_points, i + n_points])
     
     vertices = np.vstack((polyline_bottom, polyline_top))
-    surface = trimesh.Trimesh(vertices=vertices, faces=faces)
+    surface = Trimesh3d(vertices=vertices, faces=faces)
     return surface
 
 
@@ -1065,8 +1106,7 @@ def mask_with_polygon(datarray: xr.DataArray, polygon: shapely.Polygon,
         result = np.logical_not(flags)
     return result
 
-
-@pd.api.extensions.register_dataframe_accessor('pcloud')    
+   
 class Pcloud:
     
     def __init__(self, pandas_dataframe: pd.DataFrame, **kwargs):
@@ -1571,8 +1611,11 @@ class Pcloud:
     
         grid_in_hull = np.c_[grid[inside_hull], [0]*sum(inside_hull)]
         
-        def compute_weights(distances: np.ndarray, closest_nelems: Optional[int] = None,
-                    window_name: Optional[str] = None, window_args: Optional[Tuple] = None, window_kwargs: Optional[dict] = None) -> np.ndarray:
+        def compute_weights(distances: np.ndarray,
+                            closest_nelems: int|None = None,
+                            window_name: str|None = None,
+                            window_args: tuple|None = None,
+                            window_kwargs: dict|None = None) -> np.ndarray:
             """Computes distance-based weights for the averaging algorithm.
 
             Args:
@@ -1644,14 +1687,11 @@ class Pcloud:
         rotation_matrix = pl.axes.as_matrix.T
         final_mesh = mesh.rotate(rotation_matrix).translate(self.centroid().values, relative=False)
         return final_mesh
-    
-try:
-    #delete the accesor to avoid warning 
-    del xr.DataArray().pgrid
-except AttributeError:
-    pass
 
-@xr.register_dataarray_accessor('pgrid')
+if not hasattr(pd.DataFrame, "pcloud"):
+    pd.api.extensions.register_dataframe_accessor("pcloud")(Pcloud)
+
+
 class Pgrid:
     
     def __init__(self, data_array: xr.DataArray):
@@ -2070,6 +2110,9 @@ class Pgrid:
         return result
 
 
+if not hasattr(pd.DataFrame, "pgrid"):
+    pd.api.extensions.register_dataframe_accessor("pgrid")(Pgrid)
+    
 
 def structured_data_to_grid(x: ArrayLike, y: ArrayLike, values: ArrayLike, z: Optional[ArrayLike] = None) -> xr.DataArray:
     """Converts structured arrays to a regular DataArray grid.
@@ -2277,8 +2320,9 @@ def describe_csv(filepath: str, **kwargs) -> None:
         print(f'spacing z = {np.diff(np.sort(np.unique(z)))}')       
 #%% MAIN
 if __name__ == '__main__':
-    
-    #TESTS
+    pass
+
+    #%%TESTS
     
     points = [0,1,0]    
     
@@ -2313,4 +2357,64 @@ if __name__ == '__main__':
     new_z  = (0,15-90)
     rot_matrix2 = rotation_matrix(new_x, new_y, new_z)
     new_points2 = rotate(points, new_x, new_y, new_z)
+    
+    
+    #%% cylinder around 3D path
+    import pandas as pd
+    import plotly.graph_objects as go
+    path_3d = np.asarray(
+        [[0,50,75,88,99],
+         [100,120,125,130,125],
+         [300,320,335,350,362]]).T
+    path_3d_df = pd.DataFrame(path_3d, columns=['x','y','z'])    
+    
+    rad = [10,15,20,15,5]
+    cylinder = CylinderAlongPath(
+            position_disks='end-to-end',
+            radius_disks=rad,
+            num_sides_disks=30,
+            path=path_3d_df,
+            cap_ends= False)
+    list_rings = generate_disks_around_path(cylinder)
+    
+    disk=build_disk_parallel_to_plane(plane=gkp.Plane(0,80),
+                                 center=(10,50,150),
+                                 radius=10,
+                                 num_sides=10)
+    
+    
+    cylinder_trimesh=build_cylinder_around_path(cylinder)    
+
+    #Display
+    fig = go.Figure()
+    fig.add_trace(go.Scatter3d(x=path_3d_df.x,
+                                 y=path_3d_df.y,
+                                 z=path_3d_df.z,
+                                 mode='lines', name='path',
+                                 line=dict( width=5),))
+    for ring in list_rings:
+        fig.add_trace(go.Scatter3d(x=ring[:,0],
+                                   y=ring[:,1],
+                                   z=ring[:,2],
+                                   mode='lines', name='rings',
+                                   line=dict( width=5),))
+    fig.add_trace(go.Scatter3d(x=disk[:,0],
+                               y=disk[:,1],
+                               z=disk[:,2],
+                               mode='lines', name='disk',
+                               line=dict(color='black', width=10),))
+    fig.add_trace(go.Mesh3d(
+        x=cylinder_trimesh.vertices[:, 0],
+        y=cylinder_trimesh.vertices[:, 1],
+        z=cylinder_trimesh.vertices[:, 2],
+        i=cylinder_trimesh.faces[:, 0],
+        j=cylinder_trimesh.faces[:, 1],
+        k=cylinder_trimesh.faces[:, 2],
+        intensity=cylinder_trimesh.vertices[:, 2],  # optional: color by Z/property  
+        colorscale="Viridis",
+        opacity=0.7,
+        name='cylinder',
+    ))
+    fig.update_layout(scene_aspectmode="data")  # preserve true proportions
+    fig.show()    
     

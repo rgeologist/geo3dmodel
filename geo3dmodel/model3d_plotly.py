@@ -6,12 +6,14 @@ Created on Wed May 12 13:39:08 2021
 """
 from __future__ import annotations
 
-import os
+# import os
+from os import PathLike
+from pathlib import Path
 import copy
 import time
 import logging
 from itertools import islice, cycle, repeat
-from typing import Any, Iterable, List, Optional, Tuple, Union, Dict
+from typing import Any, Iterable, List, Optional, Tuple, Union, Dict, Literal,Sequence
 
 import pandas as pd
 import numpy as np
@@ -24,12 +26,6 @@ from plotly.subplots import make_subplots
 
 from shapely import LineString
 import xarray as xr
-
-try:
-    import trimesh
-    TRIMESH = True
-except ImportError:
-    TRIMESH = False
 
 import geokitpy as gkp
 from .model3d_abstract import Model3D_abstract
@@ -48,7 +44,7 @@ class Model3D_plotly(Model3D_abstract):
                 specs (list): Subplot specifications. Defaults to [[{"type": "scene"}]].
                 local_zero (tuple): The local zero coordinates (x, y, z). Defaults to (0,0,0).
         """
-        specs = kwargs.pop('specs', [[{"type": "scene"}]])
+        # specs = kwargs.pop('specs', [[{"type": "scene"}]])
         local_zero = kwargs.pop('local_zero', (0, 0, 0))
         fig = go.Figure()
         # fig = make_subplots(rows=rows, cols=cols, 
@@ -56,7 +52,7 @@ class Model3D_plotly(Model3D_abstract):
         self.local_zero = local_zero
         self.x0, self.y0, self.z0 = self.local_zero
         self.fig = fig
-        self.traces: List[go.BaseTraceType] = []
+        self.traces: list[go.BaseTraceType] = []
 
     def add_borehole_xyz(
         self,
@@ -110,7 +106,44 @@ class Model3D_plotly(Model3D_abstract):
             **kwargs: Additional keyword arguments.
         """
         self.add_borehole(borehole, **kwargs)
-
+    
+    
+    
+    def add_cylinder_around_path(
+        self,*,
+        cylinder = m3d.CylinderAlongPath,
+        **formatting_kwargs)->None:
+        """
+        Adds a cylinder around a path. The cylinder can have variable radius 
+        
+        Args:
+            cylinder (m3d.CylinderAlongPath): CylinderAlongPath instance
+            cap_ends (bool): Wheather the ends of the cylinder are caped or not 
+            **formatting_kwargs
+        """        
+        
+        cylinder_trimesh = m3d.build_cylinder_around_path(
+            cylinder)
+        self.add_triangulated_surface(
+            cylinder_trimesh,
+            **formatting_kwargs
+        )
+        
+    def add_cylinder_around_borehole(
+            self,*
+            borehole:gkp.Borehole,
+            survey_name: str = 'preferred',
+            xyz_columns: Sequence|str='xyz',
+            cylinder = m3d.CylinderAlongPath,
+            formatting_kwargs:dict|None=None,
+            )->None:
+        
+        
+        survey = borehole.surveys[survey_name]
+        col_names = [col for col in xyz_columns]
+        path_df = survey.loc[:,col_names]
+        self.add_cylinder_around_path(cylinder=cylinder)
+        
     # def plot_borehole_as_tube(self, borehole, **kwargs):
     #     #it doesn't work currently
     #     row = kwargs.pop('row', 1)
@@ -139,7 +172,10 @@ class Model3D_plotly(Model3D_abstract):
     #     trace = go.Mesh3d(x=x, y=y, z=z, **kwargs)
     #     
     #     self.traces.append(trace)
+    
 
+    
+    
     @staticmethod
     def generate_default_color_dict(borehole_dict: Dict[str, Any]) -> Dict[str, str]:
         """
@@ -629,14 +665,14 @@ class Model3D_plotly(Model3D_abstract):
         
     def add_triangulated_surface(
         self,
-        triangulated_surface: "trimesh.Trimesh",
+        triangulated_surface: m3d.Trimesh3d,
         **kwargs: Any
     ) -> None:
         """
-        Add a trimesh triangulated surface trace.
+        Add a triangulated surface trace.
 
         Args:
-            triangulated_surface (trimesh.Trimesh): The trimesh surface object.
+            triangulated_surface (m3d.Trimesh3d): The Trimesh3d surface object.
             **kwargs: Additional keyword arguments for go.Mesh3d.
         """
         mesh = triangulated_surface
@@ -1063,24 +1099,29 @@ class Model3D_plotly(Model3D_abstract):
         )
         self.traces.append(trace)
     
-    def merge_traces(
+    def merge_all_traces(
         self,
-        trace: Optional[Any] = None,
-        rows: int = 1,
-        cols: int = 1
-    ) -> None:
+        ) -> None:
         """
         Merge registered traces into the Plotly figure.
 
         Args:
-            trace (Optional[Any]): Specific trace to add. If None, adds self.traces.
-            rows (int): Subplot row span. Defaults to 1.
-            cols (int): Subplot col span. Defaults to 1.
+            
         """
-        if trace is None:
-            self.fig.add_traces(self.traces)
-        else:            
-            self.fig.add_traces(trace)
+        self.fig.add_traces(self.traces)
+
+    def add_trace(self, trace:go.BaseTraceType)->None:
+        """
+        add one trace object into the Plotly figure.
+    
+        Args:
+            
+        """
+        self.fig.add_traces([trace])
+        
+    
+    merge_traces = merge_all_traces
+    
     
     def remove_all_traces(self) -> None:
         """Clear all traces from the Plotly figure."""
@@ -1186,7 +1227,10 @@ class Model3D_plotly(Model3D_abstract):
         """Display the figure in the default web browser."""
         self.fig.show(renderer='browser')
         
-    def save_file(self, name: str, **kwargs: Any) -> None:
+    def save_file(self,
+                  filepath:PathLike,
+                  overwrite_question:bool=True,
+                  **kwargs: Any) -> None:
         """
         Save the plot to a file (HTML, PNG, JPEG, SVG, PDF).
 
@@ -1195,24 +1239,25 @@ class Model3D_plotly(Model3D_abstract):
             **kwargs: Additional arguments for the write function.
         """
         save = True
-        overwrite_question = kwargs.pop('overwrite_question', True)
         
-        if name.endswith('.html'):
+        filepath = Path(filepath)
+        
+        if filepath.name.endswith('.html'):
             func = self.fig.write_html
-        elif name.endswith(('.png', '.jpg', '.jpeg', '.svg', '.pdf')):
+        elif filepath.name.endswith(('.png', '.jpg', '.jpeg', '.svg', '.pdf')):
             func = self.fig.write_image
         else:
-            name += '.html'
+            filepath = filepath.with_name(filepath.name + '.html')
             func = self.fig.write_html            
             
-        if os.path.isfile(name) and overwrite_question:
+        if filepath.exists() and overwrite_question:
             overwrite = input("File already exists. Overwrite? (y/n): ")
             if overwrite.lower() not in ['y', 'yes']:
                 save = False
         
         if save:
-            func(name, **kwargs)            
-            if os.path.isfile(name):
+            func(filepath, **kwargs)            
+            if filepath.exists():
                 logging.info('File successfully saved')
         else:
             logging.info('File not saved')  
@@ -1288,4 +1333,4 @@ except AttributeError:
 #---- MAIN
 if __name__ == '__main__':
     ...
-    # pgrid = Pgrid.factory(st.Axes.from_trendplunge(270,0,180,0, 0,90), (0, 0, 0), (1,1,2), (60, 110, 255))
+   
