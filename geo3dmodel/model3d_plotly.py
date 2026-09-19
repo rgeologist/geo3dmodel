@@ -1333,4 +1333,401 @@ except AttributeError:
 #---- MAIN
 if __name__ == '__main__':
     ...
-   
+
+
+# ---------------------------------------------------------------------------
+# Camera & Palette Helpers
+# ---------------------------------------------------------------------------
+
+DEFAULT_CAMERA = dict(
+    eye=dict(x=-1.5, y=-1.5, z=1.2),
+    center=dict(x=0.0, y=0.0, z=0.0),
+    up=dict(x=0.0, y=0.0, z=1.0)
+)
+
+
+def get_default_camera(
+    eye: Optional[Dict[str, float]] = None,
+    center: Optional[Dict[str, float]] = None,
+    up: Optional[Dict[str, float]] = None
+) -> Dict[str, Dict[str, float]]:
+    """Return a default or customized camera layout dict."""
+    cam = copy.deepcopy(DEFAULT_CAMERA)
+    if eye is not None:
+        cam["eye"].update(eye)
+    if center is not None:
+        cam["center"].update(center)
+    if up is not None:
+        cam["up"].update(up)
+    return cam
+
+
+def get_cluster_palette() -> List[str]:
+    """Return a qualitative hex color palette for clusters (Dark24 without pure black)."""
+    color_lst = [c for c in px.colors.qualitative.Dark24]
+    if len(color_lst) > 5:
+        color_lst.pop(5)  # Drop pure black (#222222)
+    return color_lst
+
+
+def assign_cluster_color(existing_colors: Iterable[str]) -> str:
+    """Pick the next qualitative color not currently used by active clusters."""
+    palette = get_cluster_palette()
+    used = set(existing_colors)
+    for color in palette:
+        if color not in used:
+            return color
+    idx = len(list(used)) % len(palette)
+    return palette[idx]
+
+
+# ---------------------------------------------------------------------------
+# Stereonet 2D Projection Functions
+# ---------------------------------------------------------------------------
+
+def project_lambert(
+    lon: ArrayLike,
+    lat: ArrayLike,
+    center_lon: float = 0.0,
+    center_lat: float = 0.0
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Lambert azimuthal equal-area projection from spherical coordinates (radians) to 2D (x, y).
+
+    Normalized such that the primitive outer circle has radius R = 1.0.
+    """
+    lon_arr = np.asarray(lon, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+    cos_lat = np.cos(lat_arr)
+    sin_lat = np.sin(lat_arr)
+    diff_lon = lon_arr - center_lon
+    cos_diff_lon = np.cos(diff_lon)
+
+    inner_k = (
+        1.0
+        + np.sin(center_lat) * sin_lat
+        + np.cos(center_lat) * cos_lat * cos_diff_lon
+    )
+    inner_k = np.where(inner_k <= 0.0, 1e-15, inner_k)
+    k = 1.0 / np.sqrt(inner_k)
+    x = k * cos_lat * np.sin(diff_lon)
+    y = k * (np.cos(center_lat) * sin_lat - np.sin(center_lat) * cos_lat * cos_diff_lon)
+    return x, y
+
+
+def project_stereographic(
+    lon: ArrayLike,
+    lat: ArrayLike,
+    center_lon: float = 0.0,
+    center_lat: float = 0.0
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Stereographic equal-angle projection from spherical coordinates (radians) to 2D (x, y).
+
+    Normalized such that the primitive outer circle has radius R = 1.0.
+    """
+    lon_arr = np.asarray(lon, dtype=float)
+    lat_arr = np.asarray(lat, dtype=float)
+    cos_lat = np.cos(lat_arr)
+    sin_lat = np.sin(lat_arr)
+    diff_lon = lon_arr - center_lon
+    cos_diff_lon = np.cos(diff_lon)
+
+    inner_k = (
+        1.0
+        + np.sin(center_lat) * sin_lat
+        + np.cos(center_lat) * cos_lat * cos_diff_lon
+    )
+    inner_k = np.where(inner_k <= 0.0, 1e-15, inner_k)
+    k = 1.0 / inner_k
+    x = k * cos_lat * np.sin(diff_lon)
+    y = k * (np.cos(center_lat) * sin_lat - np.sin(center_lat) * cos_lat * cos_diff_lon)
+    return x, y
+
+
+# ---------------------------------------------------------------------------
+# Color Conversion & RGBA Helpers
+# ---------------------------------------------------------------------------
+
+def hex_to_rgba(color_str: str, alpha: float = 1.0) -> str:
+    """Convert hex (#RRGGBB or #RGB) or rgb(...) string to rgba(r, g, b, alpha)."""
+    if not color_str:
+        return f"rgba(255, 255, 255, {alpha})"
+    color_str = color_str.strip()
+    if color_str.startswith("rgba"):
+        return color_str
+    if color_str.startswith("rgb("):
+        inner = color_str[4:-1]
+        return f"rgba({inner}, {alpha})"
+    clean = color_str.lstrip("#")
+    if len(clean) == 6:
+        r = int(clean[0:2], 16)
+        g = int(clean[2:4], 16)
+        b = int(clean[4:6], 16)
+        return f"rgba({r}, {g}, {b}, {alpha})"
+    elif len(clean) == 3:
+        r = int(clean[0] * 2, 16)
+        g = int(clean[1] * 2, 16)
+        b = int(clean[2] * 2, 16)
+        return f"rgba({r}, {g}, {b}, {alpha})"
+    return f"rgba(255, 255, 255, {alpha})"
+
+
+# ---------------------------------------------------------------------------
+# Functional Trace & Figure Builders for Dash
+# ---------------------------------------------------------------------------
+
+def build_point_cloud_trace(
+    df: pd.DataFrame,
+    marker_colors: Optional[Union[str, Sequence[str]]] = None,
+    marker_opacity: Optional[Union[float, Sequence[float]]] = None,
+    marker_size: int = 3,
+    customdata: Optional[Any] = None,
+    hovertext: Optional[Any] = None,
+    name: str = "Point Cloud"
+) -> go.Scatter3d:
+    """Build a standalone go.Scatter3d trace from a DataFrame."""
+    m_dict: Dict[str, Any] = dict(size=marker_size)
+    if marker_colors is not None:
+        m_dict["color"] = marker_colors
+    else:
+        m_dict["color"] = "#FFFFFF"
+    if marker_opacity is not None:
+        m_dict["opacity"] = marker_opacity
+    else:
+        m_dict["opacity"] = 0.8
+
+    kwargs: Dict[str, Any] = {}
+    if customdata is not None:
+        kwargs["customdata"] = customdata
+    if hovertext is not None:
+        kwargs["hovertext"] = hovertext
+        kwargs["hoverinfo"] = "text"
+
+    return go.Scatter3d(
+        x=df["x"],
+        y=df["y"],
+        z=df["z"],
+        mode="markers",
+        marker=m_dict,
+        name=name,
+        **kwargs
+    )
+
+
+def build_point_cloud_figure(
+    df: pd.DataFrame,
+    marker_colors: Optional[Union[str, Sequence[str]]] = None,
+    marker_opacity: Optional[Union[float, Sequence[float]]] = None,
+    uirevision: str = "static_view",
+    template: Optional[go.Layout] = None,
+    dragmode: str = "orbit",
+    title: Optional[str] = None
+) -> go.Figure:
+    """Build a 3D Plotly figure with uirevision preservation and dark Paraview-style theme."""
+    trace = build_point_cloud_trace(
+        df,
+        marker_colors=marker_colors,
+        marker_opacity=marker_opacity,
+        customdata=np.arange(len(df)),
+        hovertext=[f"Point #{i}" for i in range(len(df))]
+    )
+    fig = go.Figure(data=[trace])
+    layout = template if template is not None else Model3D_plotly.paraview_template()
+    fig.update_layout(layout)
+    fig.update_layout(
+        uirevision=uirevision,
+        margin=dict(l=0, r=0, t=30 if title else 0, b=0),
+        scene=dict(
+            dragmode=dragmode,
+            camera=get_default_camera()
+        )
+    )
+    if title:
+        fig.update_layout(title=title)
+    return fig
+
+
+def build_selection_plane_figure(
+    df: pd.DataFrame,
+    plane_mode: str = "XY",
+    active_indices: Optional[Sequence[int]] = None,
+    cluster_colors: Optional[Dict[int, str]] = None,
+    hidden_indices: Optional[Set[int]] = None,
+    dragmode: str = "lasso",
+    camera_eye: Optional[Dict[str, float]] = None,
+    camera: Optional[Dict[str, Any]] = None,
+) -> go.Figure:
+    """Build the linked 2D Selection Plane figure (Scattergl) supporting box and lasso."""
+    n = len(df)
+    active_set = set(active_indices) if active_indices else set()
+    clusters = cluster_colors or {}
+    hidden_set = set(hidden_indices) if hidden_indices else set()
+
+    colors = []
+    for i in range(n):
+        if i in hidden_set:
+            colors.append("rgba(0,0,0,0.0)")
+        elif i in active_set:
+            colors.append("rgba(255,215,0,1.0)")  # Gold for active selection
+        elif i in clusters:
+            colors.append(hex_to_rgba(clusters[i], 0.85))
+        else:
+            base_alpha = 0.5 if (clusters or active_set) else 0.8
+            colors.append(f"rgba(255,255,255,{base_alpha})")
+
+    if plane_mode == "XY":
+        x_label, y_label = "Easting (m)", "Northing (m)"
+        x_pts, y_pts = df["x"].values, df["y"].values
+    elif plane_mode == "XZ":
+        x_label, y_label = "Easting (m)", "Elevation (m)"
+        x_pts, y_pts = df["x"].values, df["z"].values
+    elif plane_mode == "YZ":
+        x_label, y_label = "Northing (m)", "Elevation (m)"
+        x_pts, y_pts = df["y"].values, df["z"].values
+    elif plane_mode == "Camera":
+        cam = camera or {}
+        eye = cam.get("eye", camera_eye or DEFAULT_CAMERA["eye"])
+        center = cam.get("center", DEFAULT_CAMERA["center"])
+        up = cam.get("up", DEFAULT_CAMERA["up"])
+        proj = m3d.project_points_to_view(df[["x", "y", "z"]].values, eye=eye, center=center, up=up)
+        x_pts, y_pts = proj[:, 0], proj[:, 1]
+        x_label, y_label = "Camera View X (m)", "Camera View Y (m)"
+    else:
+        x_pts, y_pts = df["x"].values, df["y"].values
+        x_label, y_label = "X", "Y"
+
+    trace = go.Scattergl(
+        x=x_pts,
+        y=y_pts,
+        mode="markers",
+        marker=dict(
+            size=5,
+            color=colors,
+            opacity=1.0
+        ),
+        customdata=np.arange(n),
+        hoverinfo="none",
+        name="Points"
+    )
+
+    # Autoscale when camera orientation changes; preserve zoom for fixed planes
+    if plane_mode == "Camera":
+        cam_ref = camera or ({"eye": camera_eye} if camera_eye else DEFAULT_CAMERA)
+        eye_ref = cam_ref.get("eye", {})
+        ui_rev = f"camera_{eye_ref.get('x',0):.2f}_{eye_ref.get('y',0):.2f}_{eye_ref.get('z',0):.2f}"
+    else:
+        ui_rev = f"plane_{plane_mode}"
+
+    fig = go.Figure(data=[trace])
+    fig.update_layout(
+        dragmode=dragmode,
+        uirevision=ui_rev,
+        margin=dict(l=40, r=20, t=30, b=40),
+        xaxis=dict(
+            title=x_label,
+            zeroline=False,
+            showgrid=True,
+            gridcolor="#333344"
+        ),
+        yaxis=dict(
+            title=y_label,
+            zeroline=False,
+            showgrid=True,
+            gridcolor="#333344",
+            scaleanchor="x",
+            scaleratio=1
+        ),
+        plot_bgcolor="#1e1e28",
+        paper_bgcolor="#1e1e28",
+        font_color="#dddddd"
+    )
+    return fig
+
+
+def build_stereonet_figure(
+    projection: str = "equal_area",
+    step_deg: int = 10,
+    title: str = "Stereonet (Schmidt Equal-Area)"
+) -> go.Figure:
+    """Build the static stereonet grid figure in pure Plotly."""
+    grid_lines = m3d.generate_stereonet_grid_lonlat(step_deg=step_deg)
+    proj_fn = project_lambert if projection == "equal_area" else project_stereographic
+
+    traces = []
+    for lons, lats, kind in grid_lines:
+        x, y = proj_fn(lons, lats)
+        if kind == "primitive":
+            traces.append(go.Scatter(
+                x=x, y=y, mode="lines",
+                line=dict(color="#ffffff", width=2),
+                hoverinfo="none", showlegend=False
+            ))
+        elif kind == "crosshair":
+            traces.append(go.Scatter(
+                x=x, y=y, mode="lines",
+                line=dict(color="#666677", width=1.2, dash="dash"),
+                hoverinfo="none", showlegend=False
+            ))
+        else:
+            traces.append(go.Scatter(
+                x=x, y=y, mode="lines",
+                line=dict(color="#3a3a4e", width=0.8),
+                hoverinfo="none", showlegend=False
+            ))
+
+    cardinal_annotations = [
+        dict(x=0, y=1.07, text="<b>N</b>", showarrow=False, font=dict(color="#ffffff", size=14)),
+        dict(x=1.07, y=0, text="<b>E</b>", showarrow=False, font=dict(color="#ffffff", size=14)),
+        dict(x=0, y=-1.07, text="<b>S</b>", showarrow=False, font=dict(color="#ffffff", size=14)),
+        dict(x=-1.07, y=0, text="<b>W</b>", showarrow=False, font=dict(color="#ffffff", size=14)),
+    ]
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title=dict(text=title, font=dict(color="#ffffff", size=13), x=0.5, xanchor="center"),
+        annotations=cardinal_annotations,
+        margin=dict(l=20, r=20, t=40, b=20),
+        xaxis=dict(
+            visible=False,
+            range=[-1.18, 1.18],
+            fixedrange=True
+        ),
+        yaxis=dict(
+            visible=False,
+            range=[-1.18, 1.18],
+            fixedrange=True,
+            scaleanchor="x",
+            scaleratio=1
+        ),
+        plot_bgcolor="#1e1e28",
+        paper_bgcolor="#1e1e28",
+        showlegend=False
+    )
+    return fig
+
+
+def add_pole_to_stereonet(
+    fig: go.Figure,
+    dip: float,
+    dip_azimuth: float,
+    color: str = "#FF4136",
+    name: str = "Pole",
+    projection: str = "equal_area",
+    **kwargs: Any
+) -> None:
+    """Stage 1 stub / Stage 2 entry point to add a pole marker to the stereonet."""
+    strike = (dip_azimuth - 90) % 360
+    plane = gkp.Plane(strike, dip)
+    lon, lat = plane.to_pole_lonlat()
+    proj_fn = project_lambert if projection == "equal_area" else project_stereographic
+    x, y = proj_fn(lon, lat)
+
+    fig.add_trace(go.Scatter(
+        x=[x],
+        y=[y],
+        mode="markers",
+        marker=dict(size=8, color=color, symbol="circle", line=dict(color="white", width=1)),
+        name=name,
+        hovertext=f"{name}: Dip {dip:.1f}° / Azi {dip_azimuth:.1f}°",
+        hoverinfo="text",
+        **kwargs
+    ))

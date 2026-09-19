@@ -40,19 +40,21 @@ import xarray as xr
 import skimage
 
 
-try:
-    import open3d
-    OPEN3D=True
-except ImportError:
-    OPEN3D=False
+class _LazyModuleCheck:
+    def __init__(self, mod_name: str):
+        self._mod_name = mod_name
+        self._cached: Optional[bool] = None
 
-try:
-    import pyvista
-    PYVISTA=True
-except ImportError:
-    PYVISTA=False
+    def __bool__(self) -> bool:
+        if self._cached is None:
+            import importlib.util
+            self._cached = importlib.util.find_spec(self._mod_name) is not None
+        return self._cached
 
-import geokitpy as gkp
+OPEN3D = _LazyModuleCheck("open3d")
+PYVISTA = _LazyModuleCheck("pyvista")
+
+from geokitpy import geotensors as gkp
 
 PointCollection = Union[List[Point], Tuple[Point, ...],
                         MultiPoint, np.ndarray, pd.DataFrame]
@@ -1031,6 +1033,105 @@ def rotate(points: ArrayLike, new_x: Union[Tuple, List, ArrayLike, gkp.Vector], 
         rotated_pts = rot_matrix @ np.array(points).T
         
     return rotated_pts.T
+
+
+def project_points_to_view(
+    points: ArrayLike,
+    eye: Union[Dict[str, float], Sequence[float]],
+    center: Union[Dict[str, float], Sequence[float]] = (0.0, 0.0, 0.0),
+    up: Union[Dict[str, float], Sequence[float]] = (0.0, 0.0, 1.0),
+) -> np.ndarray:
+    """Project 3D points onto a 2D camera view plane.
+
+    Args:
+        points (ArrayLike): (N, 3) or (3,) points in 3D space.
+        eye (Union[Dict[str, float], Sequence[float]]): Camera eye position {x, y, z} or tuple.
+        center (Union[Dict[str, float], Sequence[float]], optional): Camera target {x, y, z} or tuple. Defaults to (0,0,0).
+        up (Union[Dict[str, float], Sequence[float]], optional): Camera up direction {x, y, z} or tuple. Defaults to (0,0,1).
+
+    Returns:
+        np.ndarray: (N, 2) array of coordinates projected onto the camera viewing plane (u, v).
+    """
+    pts = np.atleast_2d(points)
+
+    def _to_vec(val):
+        if isinstance(val, dict):
+            return np.array([val.get("x", 0.0), val.get("y", 0.0), val.get("z", 0.0)], dtype=float)
+        return np.array(val, dtype=float)
+
+    e = _to_vec(eye)
+    c = _to_vec(center)
+    u_vec = _to_vec(up)
+
+    f = c - e
+    norm_f = np.linalg.norm(f)
+    if norm_f < 1e-12:
+        f = np.array([0.0, 0.0, -1.0])
+    else:
+        f = f / norm_f
+
+    s = np.cross(f, u_vec)
+    norm_s = np.linalg.norm(s)
+    if norm_s < 1e-12:
+        fallback_up = np.array([0.0, 1.0, 0.0]) if abs(f[2]) > 0.9 else np.array([0.0, 0.0, 1.0])
+        s = np.cross(f, fallback_up)
+        s = s / np.linalg.norm(s)
+    else:
+        s = s / norm_s
+
+    v = np.cross(s, f)
+
+    shifted = pts - c
+    proj_u = shifted @ s
+    proj_v = shifted @ v
+
+    result = np.column_stack((proj_u, proj_v))
+    if np.asarray(points).ndim == 1:
+        return result[0]
+    return result
+
+
+def generate_stereonet_grid_lonlat(
+    step_deg: int = 10,
+    npoints: int = 100
+) -> List[Tuple[np.ndarray, np.ndarray, str]]:
+    """Generate longitude and latitude coordinates (in radians) for a stereonet grid.
+
+    Args:
+        step_deg (int, optional): Angular spacing between grid lines in degrees. Defaults to 10.
+        npoints (int, optional): Number of points per curve. Defaults to 100.
+
+    Returns:
+        List[Tuple[np.ndarray, np.ndarray, str]]: List of (lons, lats, kind) tuples in radians.
+    """
+    grid_lines = []
+
+    # 1. Meridians (great circles) of constant longitude
+    lons_deg = np.arange(-90 + step_deg, 90, step_deg)
+    lat_range = np.radians(np.linspace(-90, 90, npoints))
+    for lon_deg in lons_deg:
+        lon_rad = np.full(npoints, np.radians(lon_deg))
+        grid_lines.append((lon_rad, lat_range, "meridian"))
+
+    # 2. Parallels (small circles) of constant latitude
+    lats_deg = np.arange(-90 + step_deg, 90, step_deg)
+    lon_range = np.radians(np.linspace(-90, 90, npoints))
+    for lat_deg in lats_deg:
+        lat_rad = np.full(npoints, np.radians(lat_deg))
+        grid_lines.append((lon_range, lat_rad, "parallel"))
+
+    # 3. Primitive bounding circle
+    theta = np.linspace(0, 2 * np.pi, 360)
+    prim_lon = np.sin(theta) * (np.pi / 2)
+    prim_lat = np.cos(theta) * (np.pi / 2)
+    grid_lines.append((prim_lon, prim_lat, "primitive"))
+
+    # 4. Central crosshairs
+    grid_lines.append((np.zeros(npoints), np.radians(np.linspace(-90, 90, npoints)), "crosshair"))
+    grid_lines.append((np.radians(np.linspace(-90, 90, npoints)), np.zeros(npoints), "crosshair"))
+
+    return grid_lines
+
 
 try:
     #delete the accesor to avoid the warning from pandas
