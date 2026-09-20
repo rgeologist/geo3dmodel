@@ -900,7 +900,7 @@ class Model3D_plotly(Model3D_abstract):
             
         elif mode == 'weighted_avg':
             mesh = df.pcloud.fit_with_weighted_avg(**kwargs)
-            triangles = np.asarray(mesh.triangles)
+            triangles = np.asarray(mesh.faces if hasattr(mesh, 'faces') else mesh.triangles)
             vertices = np.asarray(mesh.vertices)
             trace = go.Mesh3d(
                 x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2], 

@@ -27,9 +27,9 @@ from matplotlib import tri
 import matplotlib.cm as cm
 import matplotlib.colors as colors 
 
-from scipy.spatial import ConvexHull#, convex_hull_plot_2d
+from scipy.spatial import ConvexHull, cKDTree
 from scipy.linalg import LinAlgError
-from scipy.interpolate import splprep, splev, griddata, Rbf
+from scipy.interpolate import splprep, splev, griddata, Rbf, SmoothBivariateSpline
 # from scipy.signal import windows 
 from sklearn.decomposition import PCA
 
@@ -55,6 +55,7 @@ OPEN3D = _LazyModuleCheck("open3d")
 PYVISTA = _LazyModuleCheck("pyvista")
 
 from geokitpy import geotensors as gkp
+from geokitpy import geogis
 
 PointCollection = Union[List[Point], Tuple[Point, ...],
                         MultiPoint, np.ndarray, pd.DataFrame]
@@ -68,6 +69,11 @@ class Trimesh3d:
     def __post_init__(self) -> None:
         self.vertices = np.asarray(self.vertices)
         self.faces = np.asarray(self.faces)
+
+    @property
+    def triangles(self) -> np.ndarray:
+        """Alias for faces to maintain compatibility with open3d and trimesh conventions."""
+        return self.faces
 
 
 def check_strike_dip(strike: float, dip: float) -> None:
@@ -1207,7 +1213,327 @@ def mask_with_polygon(datarray: xr.DataArray, polygon: shapely.Polygon,
         result = np.logical_not(flags)
     return result
 
-   
+
+def compute_surface_boundary_polygon(
+    points_2d: np.ndarray,
+    boundary: Literal["convex", "concave"] = "convex",
+    concave_ratio: float = 0.3,
+    spline: bool = False,
+    n_spline_pts: int = 100,
+) -> np.ndarray:
+    """Computes the 2D boundary polygon (convex or concave) enclosing a set of 2D points.
+
+    Args:
+        points_2d (np.ndarray): (N, 2) array of coordinates in the projection plane.
+        boundary (Literal["convex", "concave"], optional): Type of boundary hull. Defaults to "convex".
+        concave_ratio (float, optional): Concavity ratio (0.0 to 1.0) when boundary='concave'. Defaults to 0.3.
+        spline (bool, optional): Whether to smooth the boundary polygon with a B-spline. Defaults to False.
+        n_spline_pts (int, optional): Number of spline points if smoothed. Defaults to 100.
+
+    Returns:
+        np.ndarray: (M, 2) array of boundary polygon vertices.
+    """
+    if boundary == "concave":
+        poly_coords = geogis.concave_hull_2d(points_2d, ratio=concave_ratio, as_array=True)
+    elif boundary == "convex":
+        poly_coords = geogis.convex_hull_2d(points_2d, as_array=True)
+    else:
+        raise ValueError(f"Unknown boundary type: '{boundary}'. Expected 'convex' or 'concave'.")
+
+    if len(poly_coords) < 3:
+        raise ValueError(f"Boundary polygon must have at least 3 vertices, got {len(poly_coords)}.")
+
+    if spline and len(poly_coords) >= 4:
+        try:
+            coords_for_spline = poly_coords[:-1] if np.allclose(poly_coords[0], poly_coords[-1]) else poly_coords
+            tck, u_spl = splprep(coords_for_spline.T, u=None, s=0.0, per=1)
+            u_new = np.linspace(u_spl.min(), u_spl.max(), n_spline_pts)
+            x_new, y_new = splev(u_new, tck, der=0)
+            poly_coords = np.column_stack((x_new, y_new))
+        except (TypeError, ValueError, LinAlgError):
+            pass
+
+    return poly_coords
+
+
+def generate_masked_surface_grid(
+    boundary_polygon: np.ndarray,
+    spacing: Optional[float] = None,
+    n_elements: Optional[int] = None,
+    default_n_elements: int = 50,
+) -> np.ndarray:
+    """Generates a regular 2D grid of points bounded within a polygon.
+
+    Args:
+        boundary_polygon (np.ndarray): (K, 2) boundary polygon vertices.
+        spacing (Optional[float], optional): Target grid node spacing.
+        n_elements (Optional[int], optional): Number of grid subdivisions per axis.
+        default_n_elements (int, optional): Fallback grid resolution if neither spacing
+            nor n_elements is specified. Defaults to 50.
+
+    Returns:
+        np.ndarray: (M, 2) array of 2D grid points strictly inside the polygon.
+    """
+    xmin, ymin = boundary_polygon[:, 0].min(), boundary_polygon[:, 1].min()
+    xmax, ymax = boundary_polygon[:, 0].max(), boundary_polygon[:, 1].max()
+
+    dx = xmax - xmin
+    dy = ymax - ymin
+
+    if spacing is not None and spacing > 0:
+        n_elem_x = max(2, int(np.ceil(dx / spacing)) + 1)
+        n_elem_y = max(2, int(np.ceil(dy / spacing)) + 1)
+    elif n_elements is not None and n_elements > 0:
+        n_elem_x = max(2, int(n_elements))
+        n_elem_y = max(2, int(n_elements))
+    else:
+        n_elem_x = default_n_elements
+        n_elem_y = default_n_elements
+
+    xgrid, ygrid = np.mgrid[xmin:xmax:n_elem_x * 1j, ymin:ymax:n_elem_y * 1j]
+    grid = np.column_stack((xgrid.ravel(), ygrid.ravel()))
+
+    path = mplpath.Path(boundary_polygon)
+    inside = path.contains_points(grid)
+    grid_inside = grid[inside]
+
+    if len(grid_inside) < 3:
+        raise ValueError(
+            f"Fewer than 3 grid points fell inside boundary polygon. "
+            f"Consider decreasing spacing or increasing n_elements."
+        )
+
+    return grid_inside
+
+
+def interpolate_surface_z_weighted_avg(
+    sample_xy: np.ndarray,
+    sample_z: np.ndarray,
+    query_xy: np.ndarray,
+    k_neighbors: int = 10,
+    weighting: Literal["idw", "gaussian", "exponential", "uniform"] = "idw",
+    power: float = 2.0,
+    sigma: Optional[float] = None,
+    scale: Optional[float] = None,
+    max_distance: Optional[float] = None,
+    eps: float = 1e-12,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Interpolates surface Z elevations on 2D query locations using distance-weighted averaging.
+
+    Queries nearest neighbors in compiled C++ via scipy.spatial.cKDTree and evaluates
+    weights strictly using 2D in-plane Euclidean distances.
+
+    Args:
+        sample_xy (np.ndarray): (N, 2) in-plane coordinates of sample points.
+        sample_z (np.ndarray): (N,) elevations of sample points.
+        query_xy (np.ndarray): (M, 2) in-plane coordinates of query grid nodes.
+        k_neighbors (int, optional): Number of nearest neighbors to query. Defaults to 10.
+        weighting (Literal["idw", "gaussian", "exponential", "uniform"], optional):
+            Weighting kernel. Defaults to "idw".
+        power (float, optional): Distance exponent for IDW weighting (w = 1 / d^power). Defaults to 2.0.
+        sigma (Optional[float], optional): Standard deviation for Gaussian kernel. Defaults to None (median distance).
+        scale (Optional[float], optional): Decay length for exponential kernel. Defaults to None (median distance).
+        max_distance (Optional[float], optional): Maximum search radius. Query nodes without any sample
+            points within this radius are excluded. Defaults to None.
+        eps (float, optional): Epsilon to prevent division by zero at exact sample locations. Defaults to 1e-12.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: (valid_query_xy, interpolated_z) where valid_query_xy has shape (M_valid, 2)
+        and interpolated_z has shape (M_valid,).
+    """
+    k = min(len(sample_xy), max(1, k_neighbors))
+    tree = cKDTree(sample_xy)
+    distances, indices = tree.query(query_xy, k=k)
+
+    if k == 1:
+        distances = distances[:, np.newaxis]
+        indices = indices[:, np.newaxis]
+
+    if max_distance is not None:
+        valid_mask = distances[:, 0] <= max_distance
+        if not np.any(valid_mask):
+            raise ValueError(f"No query points have sample points within max_distance={max_distance}.")
+        query_xy = query_xy[valid_mask]
+        distances = distances[valid_mask]
+        indices = indices[valid_mask]
+        if len(query_xy) < 3:
+            raise ValueError(f"Fewer than 3 query points remain within max_distance={max_distance}.")
+
+    z_neighbors = sample_z[indices]
+
+    if weighting == "uniform":
+        z_interp = np.mean(z_neighbors, axis=1)
+    elif weighting == "gaussian":
+        if sigma is None or sigma <= 0:
+            sigma = float(np.median(distances[:, -1]))
+            if sigma <= 0:
+                sigma = 1.0
+        weights = np.exp(-0.5 * (distances / sigma) ** 2)
+        weights_sum = np.sum(weights, axis=1, keepdims=True)
+        z_interp = np.sum(z_neighbors * (weights / weights_sum), axis=1)
+    elif weighting == "exponential":
+        if scale is None or scale <= 0:
+            scale = float(np.median(distances[:, -1]))
+            if scale <= 0:
+                scale = 1.0
+        weights = np.exp(-distances / scale)
+        weights_sum = np.sum(weights, axis=1, keepdims=True)
+        z_interp = np.sum(z_neighbors * (weights / weights_sum), axis=1)
+    elif weighting == "idw":
+        exact_matches = distances < eps
+        weights = 1.0 / np.maximum(distances, eps) ** power
+        weights_sum = np.sum(weights, axis=1, keepdims=True)
+        z_interp = np.sum(z_neighbors * (weights / weights_sum), axis=1)
+        has_exact = np.any(exact_matches, axis=1)
+        if np.any(has_exact):
+            exact_col = np.argmax(exact_matches[has_exact], axis=1)
+            z_interp[has_exact] = z_neighbors[has_exact, exact_col]
+    else:
+        raise ValueError(f"Unknown weighting kernel: '{weighting}'. Expected 'idw', 'gaussian', 'exponential', or 'uniform'.")
+
+    return query_xy, z_interp
+
+
+def interpolate_surface_z_quadric(
+    sample_xy: np.ndarray,
+    sample_z: np.ndarray,
+    query_xy: np.ndarray,
+    degree: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Fits a polynomial (quadric or cubic) surface in 2D coordinates and evaluates it on query points.
+
+    For degree=2 (quadric):
+        z = c0 + c1*x + c2*y + c3*x^2 + c4*x*y + c5*y^2
+    For degree=3 (cubic):
+        includes degree 3 cross-terms: x^3, x^2*y, x*y^2, y^3
+
+    Args:
+        sample_xy (np.ndarray): (N, 2) in-plane sample coordinates.
+        sample_z (np.ndarray): (N,) sample elevations.
+        query_xy (np.ndarray): (M, 2) query grid coordinates.
+        degree (int, optional): Polynomial degree (2 or 3). Defaults to 2.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: (query_xy, interpolated_z).
+    """
+    x, y = sample_xy[:, 0], sample_xy[:, 1]
+    qx, qy = query_xy[:, 0], query_xy[:, 1]
+
+    if degree == 2:
+        cols_sample = [np.ones_like(x), x, y, x**2, x * y, y**2]
+        cols_query = [np.ones_like(qx), qx, qy, qx**2, qx * qy, qy**2]
+    elif degree == 3:
+        cols_sample = [
+            np.ones_like(x), x, y, x**2, x * y, y**2,
+            x**3, (x**2) * y, x * (y**2), y**3
+        ]
+        cols_query = [
+            np.ones_like(qx), qx, qy, qx**2, qx * qy, qy**2,
+            qx**3, (qx**2) * qy, qx * (qy**2), qy**3
+        ]
+    else:
+        raise ValueError(f"Degree must be 2 or 3, got {degree}.")
+
+    A_sample = np.column_stack(cols_sample)
+    A_query = np.column_stack(cols_query)
+
+    coeffs, _, _, _ = np.linalg.lstsq(A_sample, sample_z, rcond=None)
+    z_interp = A_query @ coeffs
+    return query_xy, z_interp
+
+
+def interpolate_surface_z_rbf(
+    sample_xy: np.ndarray,
+    sample_z: np.ndarray,
+    query_xy: np.ndarray,
+    function: str = "thin_plate",
+    smooth: float = 0.0,
+    **kwargs,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Interpolates surface Z using Radial Basis Functions with optional smoothing.
+
+    Args:
+        sample_xy (np.ndarray): (N, 2) sample points.
+        sample_z (np.ndarray): (N,) sample elevations.
+        query_xy (np.ndarray): (M, 2) query grid coordinates.
+        function (str, optional): Radial basis function type ('thin_plate', 'multiquadric',
+            'linear', 'cubic', 'gaussian'). Defaults to 'thin_plate'.
+        smooth (float, optional): Smoothing factor (>= 0). Values > 0 regularize the fit,
+            preventing overfitting on noisy data. Defaults to 0.0.
+        **kwargs: Extra parameters passed to scipy.interpolate.Rbf.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: (query_xy, interpolated_z).
+    """
+    rbf_model = Rbf(
+        sample_xy[:, 0], sample_xy[:, 1], sample_z,
+        function=function,
+        smooth=smooth,
+        **kwargs,
+    )
+    z_interp = rbf_model(query_xy[:, 0], query_xy[:, 1])
+    return query_xy, z_interp
+
+
+def interpolate_surface_z_bspline(
+    sample_xy: np.ndarray,
+    sample_z: np.ndarray,
+    query_xy: np.ndarray,
+    s: Optional[float] = None,
+    kx: int = 3,
+    ky: int = 3,
+    **kwargs,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Interpolates surface Z using SmoothBivariateSpline with noise smoothing.
+
+    Args:
+        sample_xy (np.ndarray): (N, 2) sample points.
+        sample_z (np.ndarray): (N,) sample elevations.
+        query_xy (np.ndarray): (M, 2) query grid coordinates.
+        s (Optional[float], optional): Smoothing factor determining the trade-off
+            between smoothness and closeness of fit. If None, uses default. Defaults to None.
+        kx (int, optional): Degree of the spline in x. Defaults to 3 (bicubic).
+        ky (int, optional): Degree of the spline in y. Defaults to 3 (bicubic).
+        **kwargs: Extra parameters passed to SmoothBivariateSpline.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]: (query_xy, interpolated_z).
+    """
+    spline_model = SmoothBivariateSpline(
+        sample_xy[:, 0], sample_xy[:, 1], sample_z,
+        s=s,
+        kx=kx,
+        ky=ky,
+        **kwargs,
+    )
+    z_interp = spline_model.ev(query_xy[:, 0], query_xy[:, 1])
+    return query_xy, z_interp
+
+
+def build_transformed_trimesh3d(
+    grid_xy: np.ndarray,
+    grid_z: np.ndarray,
+    plane: gkp.Plane,
+    centroid: np.ndarray,
+) -> Trimesh3d:
+    """Builds a 2D Delaunay triangulation and back-transforms vertices to world 3D coordinates.
+
+    Args:
+        grid_xy (np.ndarray): (M, 2) in-plane grid node coordinates.
+        grid_z (np.ndarray): (M,) interpolated elevations in plane reference frame.
+        plane (gkp.Plane): Fitting plane carrying orientation axes.
+        centroid (np.ndarray): 3D centroid vector used during forward centering.
+
+    Returns:
+        Trimesh3d: Reconstructed triangulated 3D surface mesh in original world coordinates.
+    """
+    triangulation = tri.Triangulation(grid_xy[:, 0], grid_xy[:, 1])
+    local_xyz = np.column_stack((grid_xy, grid_z))
+    world_vertices = (local_xyz @ plane.axes.as_matrix) + np.asarray(centroid)
+    faces = triangulation.triangles.astype(np.int64)
+    return Trimesh3d(vertices=world_vertices, faces=faces)
+
+
 class Pcloud:
     
     def __init__(self, pandas_dataframe: pd.DataFrame, **kwargs):
@@ -1311,70 +1637,333 @@ class Pcloud:
         return centroid
     
     
-    def least_squares(self, **kwargs) -> Tuple[np.ndarray, np.ndarray, int, np.ndarray]:
-        """Calculates the least squares fit of a plane to the point cloud.
+    def pca(self, n_components: int = 3, **kwargs) -> PCA:
+        """Calculates the Principal Component Analysis (PCA) of the point cloud coordinates.
 
         Args:
-            **kwargs: Additional keyword arguments.
+            n_components (int, optional): Number of components to keep. Defaults to 3.
+            **kwargs: Additional keyword arguments passed to sklearn.decomposition.PCA.
 
         Returns:
-            Tuple[np.ndarray, np.ndarray, int, np.ndarray]: The fit, residual, rank, and singular values.
-        """
-        points = self.coord_values()
-        A = np.array(np.hstack((points[:,0:2], np.ones((points.shape[0],1)))))
-        b = np.array(points[:,2].reshape((points.shape[0],1)))
-        fit, residual, rank, singular_values = np.linalg.lstsq(A, b, rcond=None)
-        return fit, residual, rank, singular_values
-        
-        
-    def fit_plane_to_points(self, **kwargs) -> Tuple[gkp.Plane, float]:
-        """Fits a plane to the points using PCA or least squares.
-
-        points is an array nx3 where each row is a point.
-
-        Args:
-            **kwargs: Keyword arguments, including 'method' ('pca' or 'least_squares').
-
-        Returns:
-            Tuple[gkp.Plane, float]: The fitted plane and the residual.
+            PCA: The fitted PCA object from scikit-learn.
 
         Raises:
-            ValueError: If there are not enough points (less than 3) to get a plane.
+            ValueError: If there are fewer points than n_components.
         """
-        method = kwargs.pop('method', 'pca')
         points = self.coord_values()
-        
-        if points.shape[0] < 3:
-            raise ValueError('Not enough points to get plane')
-        
-        if method == 'least_squares':
-            A = np.array(np.hstack((points[:,0:2], np.ones((points.shape[0],1)))))
-            b = np.array(points[:,2].reshape((points.shape[0],1)))
-            fit, residual, _, _ = np.linalg.lstsq(A, b, rcond=None)  
-            # breakpoint()
-            # errors = b - A * fit
-            
-            # A = np.matrix(np.hstack((points[:,0:2], np.ones((points.shape[0],1)))))
-            # b = np.array(points[:,2].reshape((points.shape[0],1)))
-            # fit = (A.T * A).I * A.T * b
-            # errors = b - A * fit
-            # residual = np.linalg.norm(errors)
-            # pdb.set_trace()
-            
-            plane = gkp.Vector([-fit[0,0], -fit[1,0], 1]).unit.view(gkp.Plane)
-        
-        elif method == 'pca':
-            pca = PCA(n_components=3)
-            pca.fit(points)
-            normal_vector = pca.components_[-1] 
-            plane = normal_vector.view(gkp.Plane)
-            # Compute residuals (perpendicular distances)
-            plane_point = pca.mean_
-            def point_to_plane_distance(point, plane_point, normal_vector):
-                return abs(np.dot(point - plane_point, normal_vector)) / np.linalg.norm(normal_vector)
-            residual = np.array([point_to_plane_distance(p, plane_point, normal_vector) for p in points]).sum()
-        
+        if len(points) < n_components:
+            raise ValueError(
+                f"Not enough points for PCA with {n_components} components; got {len(points)} points."
+            )
+        pca_model = PCA(n_components=n_components, **kwargs)
+        pca_model.fit(points)
+        return pca_model
+
+    def least_squares(self, **kwargs) -> Tuple[np.ndarray, np.ndarray, int, np.ndarray]:
+        """Calculates the ordinary least squares fit of a plane (z = ax + by + c) to the point cloud.
+
+        Args:
+            **kwargs: Additional keyword arguments passed to np.linalg.lstsq.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, int, np.ndarray]: The fit coefficients, residual array,
+                matrix rank, and singular values.
+        """
+        points = self.coord_values()
+        A = np.array(np.hstack((points[:, 0:2], np.ones((points.shape[0], 1)))))
+        b = np.array(points[:, 2].reshape((points.shape[0], 1)))
+        fit, residual, rank, singular_values = np.linalg.lstsq(A, b, rcond=None)
+        return fit, residual, rank, singular_values
+
+    def svd(self, **kwargs) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Calculates the Singular Value Decomposition (SVD) of centered point coordinates.
+
+        Accesses coordinates directly from self.data.
+
+        Args:
+            **kwargs: Additional keyword arguments passed to np.linalg.svd.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, np.ndarray]: Left singular vectors (U),
+                singular values (s), and right singular vectors (Vt).
+        """
+        points = self.coord_values()
+        centered = points - self.centroid().values
+        u, s, vt = np.linalg.svd(centered, full_matrices=False, **kwargs)
+        return u, s, vt
+
+    def ransac(
+        self,
+        max_iterations: int = 1000,
+        distance_threshold: float = 0.05,
+        random_state: Optional[int] = None,
+        residual_type: Literal["orthogonal_sum", "orthogonal_rmse"] = "orthogonal_sum",
+        return_inliers: bool = False,
+        **kwargs,
+    ) -> Union[Tuple[gkp.Plane, float], Tuple[gkp.Plane, float, pd.Series]]:
+        """Fits a plane to the point cloud using 3D geometric RANSAC consensus.
+
+        Accesses coordinates directly from self.data. Iteratively samples 3 random
+        non-collinear points, counts inliers within distance_threshold, and refines
+        the consensus plane using SVD on the inliers.
+
+        Args:
+            max_iterations (int, optional): Maximum number of RANSAC iterations. Defaults to 1000.
+            distance_threshold (float, optional): Orthogonal distance threshold for inlier
+                classification. Defaults to 0.05.
+            random_state (Optional[int], optional): Random seed for reproducibility. Defaults to None.
+            residual_type (Literal["orthogonal_sum", "orthogonal_rmse"], optional):
+                Metric for the returned residual ('orthogonal_sum' or 'orthogonal_rmse').
+                Defaults to "orthogonal_sum".
+            return_inliers (bool, optional): If True, returns (plane, residual, inlier_series).
+                If False, returns (plane, residual). Defaults to False.
+            **kwargs: Additional parameters.
+
+        Returns:
+            Union[Tuple[gkp.Plane, float], Tuple[gkp.Plane, float, pd.Series]]:
+                - If return_inliers is False: (plane, residual)
+                - If return_inliers is True: (plane, residual, inlier_series) where inlier_series
+                  is a boolean pd.Series indexed matching self.data.
+
+        Raises:
+            ValueError: If there are fewer than 3 points.
+        """
+        points = self.coord_values()
+        n_points = len(points)
+        if n_points < 3:
+            raise ValueError("Need at least 3 points for RANSAC plane fitting.")
+
+        rng = np.random.default_rng(random_state)
+        best_inlier_mask = None
+        best_inlier_count = -1
+
+        for _ in range(max_iterations):
+            idx = rng.choice(n_points, size=3, replace=False)
+            p0, p1, p2 = points[idx]
+            normal = np.cross(p1 - p0, p2 - p0)
+            norm = np.linalg.norm(normal)
+            if norm < 1e-10:
+                continue
+            normal = normal / norm
+            dists = np.abs((points - p0) @ normal)
+            inliers = dists <= distance_threshold
+            inlier_count = int(np.sum(inliers))
+            if inlier_count > best_inlier_count:
+                best_inlier_count = inlier_count
+                best_inlier_mask = inliers
+                if inlier_count == n_points:
+                    break
+
+        if best_inlier_mask is None or best_inlier_count < 3:
+            plane, residual = self.fit_plane_to_points(method="pca", residual_type=residual_type)
+            inlier_mask = np.ones(n_points, dtype=bool)
+        else:
+            inlier_points = points[best_inlier_mask]
+            centroid = np.mean(inlier_points, axis=0)
+            _, _, vt = np.linalg.svd(inlier_points - centroid, full_matrices=False)
+            normal_vector = vt[-1, :].copy()
+            if normal_vector[2] < 0:
+                normal_vector = -normal_vector
+            elif np.isclose(normal_vector[2], 0.0) and normal_vector[1] < 0:
+                normal_vector = -normal_vector
+
+            normal_unit = normal_vector / np.linalg.norm(normal_vector)
+            plane = gkp.Vector(normal_unit).unit.view(gkp.Plane)
+
+            inlier_dists = np.abs((inlier_points - centroid) @ normal_unit)
+            if residual_type == "orthogonal_rmse":
+                residual = float(np.sqrt(np.mean(inlier_dists ** 2)))
+            else:
+                residual = float(np.sum(inlier_dists))
+            inlier_mask = best_inlier_mask
+
+        if return_inliers:
+            inlier_series = pd.Series(inlier_mask, index=self.data.index, name="inlier")
+            return plane, residual, inlier_series
+
         return plane, residual
+
+    fit_plane_ransac = ransac
+    _fit_plane_ransac = ransac
+
+    def fit_plane_to_points(
+        self,
+        method: Literal["pca", "least_squares", "svd", "ransac"] = "pca",
+        residual_type: Literal["orthogonal_sum", "orthogonal_rmse"] = "orthogonal_sum",
+        **kwargs,
+    ) -> Tuple[gkp.Plane, float]:
+        """Fits a plane to the point cloud using PCA, least squares, SVD, or RANSAC.
+
+        Args:
+            method (Literal["pca", "least_squares", "svd", "ransac"], optional):
+                Fitting method:
+                - 'pca': Total least squares via Principal Component Analysis.
+                - 'least_squares': Ordinary least squares in Z (z = ax + by + c).
+                - 'svd': Total least squares via SVD on centered points.
+                - 'ransac': 3D geometric RANSAC consensus fitting (robust to outliers).
+                Defaults to 'pca'.
+            residual_type (Literal["orthogonal_sum", "orthogonal_rmse"], optional):
+                Residual metric to return:
+                - 'orthogonal_sum': Sum of perpendicular Euclidean distances.
+                - 'orthogonal_rmse': Root mean square perpendicular distance.
+                Defaults to 'orthogonal_sum'.
+            **kwargs: Additional parameters passed to the chosen method:
+                - For 'ransac': max_iterations (int, default 1000), distance_threshold (float, default 0.05),
+                  random_state (int, optional).
+                - For 'pca': passed to sklearn.decomposition.PCA.
+                - For 'least_squares': passed to np.linalg.lstsq.
+
+        Returns:
+            Tuple[gkp.Plane, float]: The fitted plane (with upper-hemisphere normal nz >= 0)
+                and the scalar orthogonal residual.
+
+        Raises:
+            ValueError: If there are fewer than 3 points or an unknown method is specified.
+        """
+        points = self.coord_values()
+        if points.shape[0] < 3:
+            raise ValueError("Not enough points to get plane (minimum 3 required)")
+
+        if method == "least_squares":
+            fit, _, _, _ = self.least_squares(**kwargs)
+            normal_vector = np.array([-fit[0, 0], -fit[1, 0], 1.0], dtype=float)
+            plane_point = self.centroid().values
+
+        elif method == "pca":
+            pca_model = self.pca(n_components=3, **kwargs)
+            normal_vector = pca_model.components_[-1].copy()
+            plane_point = pca_model.mean_
+
+        elif method == "svd":
+            plane_point = self.centroid().values
+            _, _, vt = self.svd(**kwargs)
+            normal_vector = vt[-1, :].copy()
+
+        elif method == "ransac":
+            max_iterations = kwargs.pop("max_iterations", 1000)
+            distance_threshold = kwargs.pop("distance_threshold", 0.05)
+            random_state = kwargs.pop("random_state", None)
+            return self.ransac(
+                max_iterations=max_iterations,
+                distance_threshold=distance_threshold,
+                random_state=random_state,
+                residual_type=residual_type,
+                return_inliers=False,
+                **kwargs,
+            )
+        else:
+            raise ValueError(
+                f"Unknown plane fitting method: '{method}'. "
+                f"Supported methods: 'pca', 'least_squares', 'svd', 'ransac'."
+            )
+
+        # Standardize normal vector to upper hemisphere (nz >= 0)
+        if normal_vector[2] < 0:
+            normal_vector = -normal_vector
+        elif np.isclose(normal_vector[2], 0.0) and normal_vector[1] < 0:
+            normal_vector = -normal_vector
+
+        norm = np.linalg.norm(normal_vector)
+        if norm == 0:
+            raise ValueError("Degenerate points: plane normal vector has zero norm.")
+        normal_unit = normal_vector / norm
+        plane = gkp.Vector(normal_unit).unit.view(gkp.Plane)
+
+        # Compute vectorized orthogonal perpendicular distances
+        distances = np.abs((points - plane_point) @ normal_unit)
+        if residual_type == "orthogonal_rmse":
+            residual = float(np.sqrt(np.mean(distances ** 2)))
+        else:
+            residual = float(np.sum(distances))
+
+        return plane, residual
+
+    def distance_to_plane(
+        self,
+        plane: gkp.Plane,
+        signed: bool = True,
+        plane_point: Optional[ArrayLike] = None,
+    ) -> pd.Series:
+        """Calculates orthogonal perpendicular distances from all points to a given plane.
+
+        This method does not modify self.data.
+
+        Args:
+            plane (gkp.Plane): The reference plane.
+            signed (bool, optional): If True, returns signed orthogonal distances
+                (+ along normal, - opposite). If False, returns absolute distances. Defaults to True.
+            plane_point (Optional[ArrayLike], optional): A point known to lie on the plane.
+                If None, uses the centroid of this point cloud. Defaults to None.
+
+        Returns:
+            pd.Series: Series of orthogonal distances indexed by DataFrame index.
+        """
+        points = self.coord_values()
+        if plane_point is None:
+            p0 = self.centroid().values
+        else:
+            p0 = np.asarray(plane_point, dtype=float)
+
+        normal = np.asarray(plane, dtype=float)
+        norm = np.linalg.norm(normal)
+        if norm == 0:
+            raise ValueError("Plane normal has zero length.")
+        normal_unit = normal / norm
+
+        dists = (points - p0) @ normal_unit
+        if not signed:
+            dists = np.abs(dists)
+
+        return pd.Series(dists, index=self.data.index, name="distance_to_plane")
+
+    def evaluate_fit_plane(
+        self,
+        plane: gkp.Plane,
+        plane_point: Optional[ArrayLike] = None,
+    ) -> Dict[str, float]:
+        """Evaluates statistical fit quality metrics of a plane against the point cloud.
+
+        This method does not modify self.data.
+
+        Args:
+            plane (gkp.Plane): The fitted plane.
+            plane_point (Optional[ArrayLike], optional): Point on the plane. Defaults to centroid.
+
+        Returns:
+            Dict[str, float]: Statistical metrics:
+                - 'rmse': Root Mean Square Error (orthogonal)
+                - 'mae': Mean Absolute Error (orthogonal)
+                - 'mad': Median Absolute Deviation
+                - 'max': Maximum absolute orthogonal error
+                - 'sum': Sum of absolute orthogonal errors
+        """
+        dists = self.distance_to_plane(plane, signed=False, plane_point=plane_point).values
+        mad = float(np.median(np.abs(dists - np.median(dists))))
+        return {
+            "rmse": float(np.sqrt(np.mean(dists ** 2))),
+            "mae": float(np.mean(dists)),
+            "mad": mad,
+            "max": float(np.max(dists)),
+            "sum": float(np.sum(dists)),
+        }
+
+    def distance_to_surface(
+        self,
+        surface: Trimesh3d,
+    ) -> pd.Series:
+        """Calculates Euclidean distances from each point in the cloud to the nearest vertex of the surface mesh.
+
+        This method does not modify self.data.
+
+        Args:
+            surface (Trimesh3d): The surface mesh to measure distances against.
+
+        Returns:
+            pd.Series: Series of nearest-vertex Euclidean distances indexed by DataFrame index.
+        """
+        tree = cKDTree(surface.vertices)
+        dists, _ = tree.query(self.coord_values())
+        return pd.Series(dists, index=self.data.index, name="distance_to_surface")
 
     def project_points_on_plane(self, plane: gkp.Plane, **kwargs) -> np.ndarray:
         """Projects the point cloud onto a given plane.
@@ -1529,265 +2118,179 @@ class Pcloud:
         
         return triangulation
     
-    def fit_with_open3d(self, method: str = 'poisson', **kwargs) -> "open3d.geometry.TriangleMesh":
-        """Fits a 3D surface to the point cloud using Open3D algorithms.
+    
+    def fit_surface_to_points(
+        self,
+        method: Literal["weighted_avg", "quadric", "rbf", "bspline"] = "weighted_avg",
+        plane: Optional[gkp.Plane] = None,
+        spacing: Optional[float] = None,
+        n_elements: Optional[int] = None,
+        boundary: Literal["convex", "concave"] = "convex",
+        concave_ratio: float = 0.3,
+        spline: bool = False,
+        **kwargs,
+    ) -> Trimesh3d:
+        """Fits a 3D surface mesh to the point cloud using the chosen surface interpolation method.
 
-        Algorithms available: 'poisson', 'ball_pivoting', 'alpha_shape'.
+        Pipeline:
+        1. Projects points onto a best-fit plane (computed via PCA if plane is None).
+        2. Computes the 2D boundary polygon (convex or concave hull, optionally smoothed).
+        3. Generates a regular 2D grid masked inside the boundary polygon.
+        4. Interpolates elevations w = f(u, v) using the chosen method:
+           - 'weighted_avg': Distance-weighted averaging (IDW, Gaussian, Exponential, Uniform).
+           - 'quadric': Polynomial surface fitting (degree 2 or 3).
+           - 'rbf': Radial Basis Functions (thin-plate spline, multiquadric, etc.) with smoothing.
+           - 'bspline': Smooth bivariate splines (SmoothBivariateSpline) with noise filtering.
+        5. Triangulates the grid and transforms the mesh back to world 3D coordinates.
 
         Args:
-            method (str, optional): The Open3D method to use. Defaults to 'poisson'.
-            **kwargs: Additional keyword arguments such as 'plane', 'radius_factor', 'alpha'.
+            method (Literal["weighted_avg", "quadric", "rbf", "bspline"], optional):
+                Surface fitting algorithm to use. Defaults to "weighted_avg".
+            plane (Optional[gkp.Plane], optional): Orientation plane. If None, fitted via PCA.
+            spacing (Optional[float], optional): Target grid node spacing in projection plane.
+            n_elements (Optional[int], optional): Number of grid intervals per axis. Defaults to 50 if spacing is None.
+            boundary (Literal["convex", "concave"], optional): Boundary hull type. Defaults to "convex".
+            concave_ratio (float, optional): Concavity ratio (0.0 to 1.0) when boundary='concave'. Defaults to 0.3.
+            spline (bool, optional): Whether to smooth the boundary polygon with a B-spline. Defaults to False.
+            **kwargs: Method-specific parameters:
+                - For 'weighted_avg': k_neighbors, weighting ('idw'/'gaussian'/'exponential'/'uniform'),
+                  power, sigma, scale, max_distance.
+                - For 'quadric': degree (2 or 3, default 2).
+                - For 'rbf': function ('thin_plate'/'multiquadric'/'cubic'/'gaussian'/'linear', default 'thin_plate'),
+                  smooth (float, default 0.0).
+                - For 'bspline': s (smoothing factor, float or None), kx (int, default 3), ky (int, default 3).
 
         Returns:
-            open3d.geometry.TriangleMesh: The reconstructed surface mesh.
-
-        Raises:
-            ValueError: If the open3d module is not installed.
+            Trimesh3d: Triangulated surface mesh containing vertices and faces.
         """
-        if not OPEN3D:
-            raise ValueError("Module open3d needed to run this function")
-        plane = kwargs.pop('plane', None)
         if plane is None:
-            pl, _ = self.fit_plane_to_points(method='pca')
+            pl, _ = self.fit_plane_to_points(method="pca")
         else:
             pl = plane
-        
-        new_xyz  = self.project_points_on_plane(pl)
-        
-        pcd = open3d.geometry.PointCloud()
-        # pdb.set_trace()
-        pcd.points = open3d.utility.Vector3dVector(new_xyz)
-        pcd.remove_statistical_outlier(10, 500)        
-        pcd.estimate_normals(search_param=open3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-        centroid = pcd.get_center()
-        pcd.translate(np.array([0,0,0]), relative=False)
-        # bbox = pcd.get_axis_aligned_bounding_box()
-        
-        if method == 'poisson':
-            defaults = dict(depth=4, width=0, scale=1.1, linear_fit=False)
-            defaults.update(kwargs)
-            kwargs = defaults
-            mesh = open3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, **kwargs)[0]
-        elif method == 'ball_pivoting':
-            radius_factor = kwargs.pop('radius_factor', 3)
-            distances = pcd.compute_nearest_neighbor_distance()
-            avg_dist = np.mean(distances)
-            radius = radius_factor * avg_dist            
-            mesh = open3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(pcd,open3d.utility.DoubleVector([radius, radius * 2]))
-        elif method == 'alpha_shape':
-            alpha = kwargs.pop('alpha', 0.5)
-            mesh = open3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, alpha=alpha)
-        
-        #next lines will 
-        #   -build a convex hull around the point cloud
-        #   -project it on the surface
-        #   -filter out the vertices outside the convex hull
-        #   -generate a new vertex array including the convex hull
-        #   -re-triangulate and generate a new TriangleMesh
-        #   -rotate it and translate it to the original position
-        #   -return
-        
-        #get convex hull around points
-        processed_xyz = pd.DataFrame(np.asarray(pcd.points), columns=['x','y','z'])
-        hull3D = processed_xyz.pcloud.convex_hull_3D(plane=gkp.Plane(0,0),
-                                                  spline=True)
-        # pdb.set_trace()
-        vertices = np.asarray(mesh.vertices)
-        #project the convex hull into the mesh
-        #Try to use Rbf. If some error is raised, fall back to griddata
-        #griddata cannot extrapolate so zeros are added if needed
-        
-        try:
-            rbf3 = Rbf(vertices[:,0], vertices[:,1], vertices[:,2], degree=-1)
-            hull3D[:,2] = rbf3(hull3D[:,0], hull3D[:,1])
-        except LinAlgError as e:
-            hull3D[:,2] = griddata(vertices[:,:2], vertices[:,2], hull3D[:,:2],
-                                   method='cubic', fill_value=0)
-            
-        #clip z-values of the convex hull so they are less than n*std from mean
-        n=1
-        z_hull_std = np.std(hull3D[:,2])
-        z_hull_mean = np.mean(hull3D[:,2])
-        hull3D[:,2] = np.clip(hull3D[:,2],
-                              z_hull_mean-n*z_hull_std,
-                              z_hull_mean+n*z_hull_std)
-        
-        #check which vertices of the mesh lie inside the convex hull
-        #this is done in 2d using only xy
-        path = mplpath.Path(hull3D[:,:2])
-        inside_hull=path.contains_points(vertices[:,:2])
-        
-        #keep only vertices inside hull and concatenate with hull
-        vertices_crop = np.vstack((vertices[inside_hull,:], hull3D))
-        
-        #triangulate the new array
-        triangulation = tri.Triangulation(vertices_crop[:,0],vertices_crop[:,1])
-        
-        trimesh_vertices  = open3d.utility.Vector3dVector(vertices_crop)
-        trimesh_triangles = open3d.utility.Vector3iVector(triangulation.triangles)
-        mesh_crop = open3d.geometry.TriangleMesh(trimesh_vertices, trimesh_triangles)
-        
-        
-        #plot to test this part of the function. Normally commented
-        # import matplotlib.pyplot as plt
-        # fig = plt.figure()
-        # ax=fig.add_subplot(projection='3d')
-        # ax.plot(processed_xyz.x, processed_xyz.y, processed_xyz.z, 'k.')
-        # orig_tri = tri.Triangulation(vertices[:,0], vertices[:,1],
-        #                              triangles=np.asarray(mesh.triangles))
-        # ax.plot_trisurf(orig_tri, Z=vertices[:,2])
-        # ax.plot(hull3D[:,0], hull3D[:,1], hull3D[:,2], 'r.')
-        # pdb.set_trace()
-        # ax.plot(hull3D[:,0], hull3D[:,1], 0, 'g.')
-        # ax.plot(vertices[:,0], vertices[:,1], vertices[:,2], 'm.')
-        # ax.plot(vertices_crop[:,0], vertices_crop[:,1], vertices_crop[:,2], 'b.')
-        # ax.plot_trisurf(triangulation, Z=vertices_crop[:,2])
-        
-        
-        #return to original base
-        rotation_matrix = pl.axes.__array__.T
-        final_mesh = mesh_crop.rotate(rotation_matrix).translate(centroid, relative=False)
-        # new_vertices = ((vertices @ rotation_matrix) + centroid)
-        
-        # triangles = np.asarray(final_mesh.triangles)
-        # vertices = np.asarray(final_mesh.vertices)
-        
-        # return vertices, triangles
-        return final_mesh
-    
-    def fit_with_weighted_avg(self, **kwargs) -> "open3d.geometry.TriangleMesh":
-        """Fits a surface to the point cloud using a weighted average technique.
 
-        Projects points on a plane, grids them, and computes Z values by weighted averaging.
+        # 1. Project points onto local plane frame (u, v, w)
+        temp_xyz = self.project_points_on_plane(pl)
+        sample_xy = temp_xyz[:, :2]
+        sample_z = temp_xyz[:, 2]
 
-        Args:
-            **kwargs: Keyword arguments including 'plane', 'spacing', 'n_elements', and 'average_kwargs'.
+        # 2. Compute 2D boundary polygon (convex or concave)
+        boundary_poly = compute_surface_boundary_polygon(
+            sample_xy,
+            boundary=boundary,
+            concave_ratio=concave_ratio,
+            spline=spline,
+        )
 
-        Returns:
-            open3d.geometry.TriangleMesh: The resulting triangulated mesh.
-        """
-        
-        plane = kwargs.pop('plane', None)
-        spacing = kwargs.pop('spacing', None)
-        n_elements = kwargs.pop('n_elements', None)
-        
-        average_kwargs_default = {'closest_nelems':None, 'window_name':None,
-                                  'window_args':None, 'window_kwargs':None}
-        average_kwargs_default.update(kwargs.pop('average_kwargs',{}))
-        average_kwargs=average_kwargs_default
-        
-        if plane is None:
-            pl, _ = self.fit_plane_to_points(method='pca')
+        # 3. Build regular grid masked inside the boundary
+        grid_xy = generate_masked_surface_grid(
+            boundary_poly,
+            spacing=spacing,
+            n_elements=n_elements,
+        )
+
+        # 4. Interpolate elevations using chosen method
+        if method == "weighted_avg":
+            k_neighbors = kwargs.pop("closest_nelems", kwargs.pop("k_neighbors", 10))
+            weighting = kwargs.pop("weighting", "idw")
+            power = kwargs.pop("power", 2.0)
+            sigma = kwargs.pop("sigma", None)
+            scale = kwargs.pop("scale", None)
+            max_distance = kwargs.pop("max_distance", None)
+            valid_grid_xy, grid_z = interpolate_surface_z_weighted_avg(
+                sample_xy=sample_xy,
+                sample_z=sample_z,
+                query_xy=grid_xy,
+                k_neighbors=k_neighbors,
+                weighting=weighting,
+                power=power,
+                sigma=sigma,
+                scale=scale,
+                max_distance=max_distance,
+            )
+        elif method == "quadric":
+            degree = kwargs.pop("degree", 2)
+            valid_grid_xy, grid_z = interpolate_surface_z_quadric(
+                sample_xy=sample_xy,
+                sample_z=sample_z,
+                query_xy=grid_xy,
+                degree=degree,
+            )
+        elif method == "rbf":
+            function = kwargs.pop("function", "thin_plate")
+            smooth = kwargs.pop("smooth", 0.0)
+            valid_grid_xy, grid_z = interpolate_surface_z_rbf(
+                sample_xy=sample_xy,
+                sample_z=sample_z,
+                query_xy=grid_xy,
+                function=function,
+                smooth=smooth,
+                **kwargs,
+            )
+        elif method == "bspline":
+            s = kwargs.pop("s", None)
+            kx = kwargs.pop("kx", 3)
+            ky = kwargs.pop("ky", 3)
+            valid_grid_xy, grid_z = interpolate_surface_z_bspline(
+                sample_xy=sample_xy,
+                sample_z=sample_z,
+                query_xy=grid_xy,
+                s=s,
+                kx=kx,
+                ky=ky,
+                **kwargs,
+            )
         else:
-            pl = plane
-        
-        temp_xyz  = self.project_points_on_plane(pl)
-        
-        temp_xyz_df = pd.DataFrame(temp_xyz, columns=['x','y','z'])
-        hull3D   = temp_xyz_df.pcloud.convex_hull_3D(plane=gkp.Plane(0,0),
-                                                  spline=True)
-        
-        #create grid
-        
-        xmin=hull3D[:,0].min()
-        xmax=hull3D[:,0].max()
-        ymin=hull3D[:,1].min()
-        ymax=hull3D[:,1].max()
-        if spacing:
-            n_elem_x = round((xmax-xmin)/spacing)
-            n_elem_y = round((ymax-ymin)/spacing)        
-        elif n_elements:
-            n_elem_x = n_elements
-            n_elem_y = n_elements
-            
-        # xgrid = np.ogrid[xmin:xmax:n_elem_x*1j]
-        # ygrid = np.ogrid[ymin:ymax:n_elem_y*1j]
-        xgrid, ygrid = np.mgrid[xmin:xmax:n_elem_x*1j, ymin:ymax:n_elem_y*1j]
-        grid = np.c_[xgrid.flatten(), ygrid.flatten()]
-        
-        #check which vertices of the mesh lie inside the convex hull
-        #this is done in 2d using only xy
-        path = mplpath.Path(hull3D[:,:2])
-        inside_hull=path.contains_points(grid)
-    
-        grid_in_hull = np.c_[grid[inside_hull], [0]*sum(inside_hull)]
-        
-        def compute_weights(distances: np.ndarray,
-                            closest_nelems: int|None = None,
-                            window_name: str|None = None,
-                            window_args: tuple|None = None,
-                            window_kwargs: dict|None = None) -> np.ndarray:
-            """Computes distance-based weights for the averaging algorithm.
+            raise ValueError(
+                f"Unknown surface fitting method: '{method}'. "
+                f"Supported methods: 'weighted_avg', 'quadric', 'rbf', 'bspline'."
+            )
 
-            Args:
-                distances (np.ndarray): Array of distances to neighboring points.
-                closest_nelems (Optional[int], optional): Number of elements to consider. Defaults to None.
-                window_name (Optional[str], optional): The name of a scipy window function. Defaults to None.
-                window_args (Optional[Tuple], optional): Window arguments. Defaults to None.
-                window_kwargs (Optional[dict], optional): Window keyword arguments. Defaults to None.
+        # 5. Triangulate and transform back to world coordinates
+        mesh = build_transformed_trimesh3d(
+            grid_xy=valid_grid_xy,
+            grid_z=grid_z,
+            plane=pl,
+            centroid=self.centroid().values,
+        )
 
-            Returns:
-                np.ndarray: The computed weights.
+        return mesh
 
-            Raises:
-                ValueError: If the open3d module is not installed.
-            """
-            
-            if not OPEN3D:
-                raise ValueError("Module open3d needed to run this function")
-            if window_name:
-                #All windows are symmetrical, so we need to generate one that's
-                #twice the num_elements and take only the half
-                if closest_nelems is None:
-                    window_size=2*len(distances)
-                    closest_nelems = len(distances)
-                else:
-                    window_size=2*closest_nelems
-                window=getattr(windows, window_name)(window_size, *window_args, **window_kwargs)
-                #take only half of the window
-                weights=window[window_size//2:]
-            else:
-                #if no window is specified calculate the weights from 1/distances
-                argsort = np.argsort(distances)
-                weights = 1/distances[argsort[:closest_nelems]]
-            return weights
-                
-        
-        closest_nelems = average_kwargs.get('closest_nelems',None)
-            
-        
-        z_lst=[]
-        for point in grid_in_hull:
-            distances=np.sqrt(np.sum((temp_xyz-point)**2, axis=1))
-            argsort = np.argsort(distances)
-            z_to_avg=temp_xyz[argsort[:closest_nelems],2]
-            weights = compute_weights(distances, **average_kwargs)
-            z=np.average(z_to_avg, weights=weights[:len(z_to_avg)])
-            z_lst.append(z)
-        grid_in_hull[:,2]=z_lst
-        
-        
-        triangulation = tri.Triangulation(grid_in_hull[:,0],grid_in_hull[:,1])
-        
-        trimesh_vertices  = open3d.utility.Vector3dVector(grid_in_hull)
-        trimesh_triangles = open3d.utility.Vector3iVector(triangulation.triangles)
-        mesh = open3d.geometry.TriangleMesh(trimesh_vertices, trimesh_triangles)
-        
-        # # plot to test this part of the function. Normally commented
-        import matplotlib.pyplot as plt
-        fig = plt.figure()
-        ax=fig.add_subplot(projection='3d')
-        # ax.plot(new_xyz[:,0],new_xyz[:,1],new_xyz[:,2], 'k.')
-        ax.plot(hull3D[:,0],hull3D[:,1], 0, 'r-')
-        ax.plot(grid_in_hull[:,0], grid_in_hull[:,1], grid_in_hull[:,2], 'g.')
-        # # ax.plot_trisurf(triangulation, Z=grid_in_hull[:,2])
-        # pdb.set_trace()        
-        
-        
-        #return to original base
-        rotation_matrix = pl.axes.as_matrix.T
-        final_mesh = mesh.rotate(rotation_matrix).translate(self.centroid().values, relative=False)
-        return final_mesh
+    def fit_with_weighted_avg(
+        self,
+        plane: Optional[gkp.Plane] = None,
+        spacing: Optional[float] = None,
+        n_elements: Optional[int] = None,
+        boundary: Literal["convex", "concave"] = "convex",
+        concave_ratio: float = 0.3,
+        spline: bool = False,
+        k_neighbors: int = 10,
+        weighting: Literal["idw", "gaussian", "exponential", "uniform"] = "idw",
+        power: float = 2.0,
+        sigma: Optional[float] = None,
+        scale: Optional[float] = None,
+        max_distance: Optional[float] = None,
+        **kwargs,
+    ) -> Trimesh3d:
+        """Fits a 3D surface to the point cloud using distance-weighted averaging.
+
+        Convenience wrapper delegating to fit_surface_to_points(method='weighted_avg').
+        """
+        return self.fit_surface_to_points(
+            method="weighted_avg",
+            plane=plane,
+            spacing=spacing,
+            n_elements=n_elements,
+            boundary=boundary,
+            concave_ratio=concave_ratio,
+            spline=spline,
+            k_neighbors=k_neighbors,
+            weighting=weighting,
+            power=power,
+            sigma=sigma,
+            scale=scale,
+            max_distance=max_distance,
+            **kwargs,
+        )
 
 if not hasattr(pd.DataFrame, "pcloud"):
     pd.api.extensions.register_dataframe_accessor("pcloud")(Pcloud)
