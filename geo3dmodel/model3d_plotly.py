@@ -1705,6 +1705,88 @@ def build_stereonet_figure(
     return fig
 
 
+def create_plane_disk_traces(
+    strike: float,
+    dip: float,
+    center: Sequence[float],
+    radius: float = 1.0,
+    color: str = "#636efa",
+    opacity: float = 0.45,
+    name: str = "Plane",
+    draw_outline: bool = True,
+    outline_color: Optional[str] = None,
+    outline_width: float = 2.5,
+    num_sides: int = 36,
+    custom_info: Optional[str] = None,
+) -> Tuple[go.Mesh3d, Optional[go.Scatter3d]]:
+    """Build a 3D Mesh3d disk and optional Scatter3d perimeter outline for a structural plane.
+
+    Args:
+        strike: Strike angle in degrees (Right-Hand-Rule).
+        dip: Dip angle in degrees (0 to 90).
+        center: 3D center coordinates (x, y, z).
+        radius: Radius of the disk in dataset units.
+        color: Mesh surface color hex or rgba string.
+        opacity: Opacity for the mesh surface (0.0 - 1.0).
+        name: Name of the plane trace.
+        draw_outline: Whether to include a Scatter3d perimeter trace.
+        outline_color: Color of the perimeter line (defaults to color).
+        outline_width: Line width of perimeter outline.
+        num_sides: Number of segments for the circular boundary.
+        custom_info: Extra info text for hovertemplate.
+
+    Returns:
+        Tuple of (go.Mesh3d, Optional[go.Scatter3d]).
+    """
+    disk, triangles = m3d.build_disk(
+        strike=float(strike),
+        dip=float(dip),
+        center=tuple(center),
+        radius=float(radius),
+        num_sides=int(num_sides)
+    )
+    i, j, k = triangles.T
+
+    hovertemplate = (
+        f"<b>{name}</b><br>"
+        f"Strike: {strike:.1f}°<br>"
+        f"Dip: {dip:.1f}°"
+    )
+    if custom_info:
+        hovertemplate += f"<br>{custom_info}"
+    hovertemplate += "<extra></extra>"
+
+    mesh_trace = go.Mesh3d(
+        x=disk[:, 0],
+        y=disk[:, 1],
+        z=disk[:, 2],
+        i=i,
+        j=j,
+        k=k,
+        color=color,
+        opacity=opacity,
+        name=name,
+        hovertemplate=hovertemplate,
+        showlegend=False,
+    )
+
+    outline_trace = None
+    if draw_outline:
+        outline_c = outline_color or color
+        outline_trace = go.Scatter3d(
+            x=disk[:, 0],
+            y=disk[:, 1],
+            z=disk[:, 2],
+            mode="lines",
+            line=dict(color=outline_c, width=outline_width),
+            name=f"{name} outline",
+            hoverinfo="none",
+            showlegend=False,
+        )
+
+    return mesh_trace, outline_trace
+
+
 def add_pole_to_stereonet(
     fig: go.Figure,
     dip: float,
@@ -1712,22 +1794,102 @@ def add_pole_to_stereonet(
     color: str = "#FF4136",
     name: str = "Pole",
     projection: str = "equal_area",
+    strike: Optional[float] = None,
+    residual: Optional[float] = None,
+    marker_size: int = 9,
+    symbol: str = "circle",
     **kwargs: Any
 ) -> None:
-    """Stage 1 stub / Stage 2 entry point to add a pole marker to the stereonet."""
-    strike = (dip_azimuth - 90) % 360
-    plane = gkp.Plane(strike, dip)
+    """Add a structural plane pole marker to the stereonet.
+
+    Args:
+        fig: Target stereonet go.Figure.
+        dip: Dip angle in degrees.
+        dip_azimuth: Dip direction (azimuth) in degrees.
+        color: Marker color.
+        name: Name for hover tooltip and legend.
+        projection: 'equal_area' (Schmidt) or 'equal_angle' (Wulff).
+        strike: Optional strike in degrees for hover display.
+        residual: Optional residual error for hover display.
+        marker_size: Marker radius in pixels.
+        symbol: Plotly scatter marker symbol.
+        **kwargs: Extra arguments passed to go.Scatter.
+    """
+    if strike is None:
+        calc_strike = (dip_azimuth - 90) % 360
+    else:
+        calc_strike = strike
+
+    plane = gkp.Plane(calc_strike, dip)
     lon, lat = plane.to_pole_lonlat()
     proj_fn = project_lambert if projection == "equal_area" else project_stereographic
     x, y = proj_fn(lon, lat)
+
+    hover_parts = [f"<b>{name}</b>", f"Dip: {dip:.1f}° ➔ {dip_azimuth:.1f}°", f"Strike: {calc_strike:.1f}°"]
+    if residual is not None:
+        hover_parts.append(f"RMSE: {residual:.4f} m")
+    hovertext = "<br>".join(hover_parts)
 
     fig.add_trace(go.Scatter(
         x=[x],
         y=[y],
         mode="markers",
-        marker=dict(size=8, color=color, symbol="circle", line=dict(color="white", width=1)),
+        marker=dict(
+            size=marker_size,
+            color=color,
+            symbol=symbol,
+            line=dict(color="#ffffff", width=1.2)
+        ),
         name=name,
-        hovertext=f"{name}: Dip {dip:.1f}° / Azi {dip_azimuth:.1f}°",
+        hovertext=hovertext,
         hoverinfo="text",
+        showlegend=False,
         **kwargs
     ))
+
+
+def add_great_circle_to_stereonet(
+    fig: go.Figure,
+    strike: float,
+    dip: float,
+    color: str = "#FF4136",
+    name: str = "Great Circle",
+    projection: str = "equal_area",
+    line_width: float = 1.8,
+    dash: str = "solid",
+    npoints: int = 100,
+    **kwargs: Any
+) -> None:
+    """Add a structural plane great circle (cyclographic trace) to the stereonet.
+
+    Args:
+        fig: Target stereonet go.Figure.
+        strike: Strike angle in degrees.
+        dip: Dip angle in degrees.
+        color: Line color.
+        name: Name for hover tooltip.
+        projection: 'equal_area' (Schmidt) or 'equal_angle' (Wulff).
+        line_width: Width of the great circle line.
+        dash: Plotly line dash pattern ('solid', 'dash', 'dot').
+        npoints: Number of evaluation points along the great circle.
+        **kwargs: Extra arguments passed to go.Scatter.
+    """
+    plane = gkp.Plane(strike, dip)
+    lons, lats = plane.to_greatcircle_lonlat(npoints=npoints)
+    proj_fn = project_lambert if projection == "equal_area" else project_stereographic
+    x, y = proj_fn(lons, lats)
+
+    hovertext = f"<b>{name}</b><br>Strike: {strike:.1f}° / Dip: {dip:.1f}°"
+
+    fig.add_trace(go.Scatter(
+        x=x,
+        y=y,
+        mode="lines",
+        line=dict(color=color, width=line_width, dash=dash),
+        name=name,
+        hovertext=hovertext,
+        hoverinfo="text",
+        showlegend=False,
+        **kwargs
+    ))
+

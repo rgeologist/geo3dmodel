@@ -1306,7 +1306,7 @@ def generate_masked_surface_grid(
     return grid_inside
 
 
-def interpolate_surface_z_weighted_avg(
+def fit_surface_z_weighted_avg(
     sample_xy: np.ndarray,
     sample_z: np.ndarray,
     query_xy: np.ndarray,
@@ -1318,7 +1318,7 @@ def interpolate_surface_z_weighted_avg(
     max_distance: Optional[float] = None,
     eps: float = 1e-12,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Interpolates surface Z elevations on 2D query locations using distance-weighted averaging.
+    """Fits surface Z elevations on 2D query locations using distance-weighted averaging.
 
     Queries nearest neighbors in compiled C++ via scipy.spatial.cKDTree and evaluates
     weights strictly using 2D in-plane Euclidean distances.
@@ -1338,8 +1338,8 @@ def interpolate_surface_z_weighted_avg(
         eps (float, optional): Epsilon to prevent division by zero at exact sample locations. Defaults to 1e-12.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]: (valid_query_xy, interpolated_z) where valid_query_xy has shape (M_valid, 2)
-        and interpolated_z has shape (M_valid,).
+        Tuple[np.ndarray, np.ndarray]: (valid_query_xy, fitted_z) where valid_query_xy has shape (M_valid, 2)
+        and fitted_z has shape (M_valid,).
     """
     k = min(len(sample_xy), max(1, k_neighbors))
     tree = cKDTree(sample_xy)
@@ -1394,7 +1394,7 @@ def interpolate_surface_z_weighted_avg(
     return query_xy, z_interp
 
 
-def interpolate_surface_z_quadric(
+def fit_surface_z_quadric(
     sample_xy: np.ndarray,
     sample_z: np.ndarray,
     query_xy: np.ndarray,
@@ -1414,7 +1414,7 @@ def interpolate_surface_z_quadric(
         degree (int, optional): Polynomial degree (2 or 3). Defaults to 2.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]: (query_xy, interpolated_z).
+        Tuple[np.ndarray, np.ndarray]: (query_xy, fitted_z).
     """
     x, y = sample_xy[:, 0], sample_xy[:, 1]
     qx, qy = query_xy[:, 0], query_xy[:, 1]
@@ -1442,7 +1442,7 @@ def interpolate_surface_z_quadric(
     return query_xy, z_interp
 
 
-def interpolate_surface_z_rbf(
+def fit_surface_z_rbf(
     sample_xy: np.ndarray,
     sample_z: np.ndarray,
     query_xy: np.ndarray,
@@ -1450,7 +1450,7 @@ def interpolate_surface_z_rbf(
     smooth: float = 0.0,
     **kwargs,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Interpolates surface Z using Radial Basis Functions with optional smoothing.
+    """Fits surface Z using Radial Basis Functions with optional smoothing.
 
     Args:
         sample_xy (np.ndarray): (N, 2) sample points.
@@ -1463,7 +1463,7 @@ def interpolate_surface_z_rbf(
         **kwargs: Extra parameters passed to scipy.interpolate.Rbf.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]: (query_xy, interpolated_z).
+        Tuple[np.ndarray, np.ndarray]: (query_xy, fitted_z).
     """
     rbf_model = Rbf(
         sample_xy[:, 0], sample_xy[:, 1], sample_z,
@@ -1475,7 +1475,7 @@ def interpolate_surface_z_rbf(
     return query_xy, z_interp
 
 
-def interpolate_surface_z_bspline(
+def fit_surface_z_bspline(
     sample_xy: np.ndarray,
     sample_z: np.ndarray,
     query_xy: np.ndarray,
@@ -1484,7 +1484,7 @@ def interpolate_surface_z_bspline(
     ky: int = 3,
     **kwargs,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Interpolates surface Z using SmoothBivariateSpline with noise smoothing.
+    """Fits surface Z using SmoothBivariateSpline with noise smoothing.
 
     Args:
         sample_xy (np.ndarray): (N, 2) sample points.
@@ -1497,7 +1497,7 @@ def interpolate_surface_z_bspline(
         **kwargs: Extra parameters passed to SmoothBivariateSpline.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]: (query_xy, interpolated_z).
+        Tuple[np.ndarray, np.ndarray]: (query_xy, fitted_z).
     """
     spline_model = SmoothBivariateSpline(
         sample_xy[:, 0], sample_xy[:, 1], sample_z,
@@ -1508,6 +1508,13 @@ def interpolate_surface_z_bspline(
     )
     z_interp = spline_model.ev(query_xy[:, 0], query_xy[:, 1])
     return query_xy, z_interp
+
+
+# Backward-compatibility aliases for module-level functions
+interpolate_surface_z_weighted_avg = fit_surface_z_weighted_avg
+interpolate_surface_z_quadric = fit_surface_z_quadric
+interpolate_surface_z_rbf = fit_surface_z_rbf
+interpolate_surface_z_bspline = fit_surface_z_bspline
 
 
 def build_transformed_trimesh3d(
@@ -2119,61 +2126,31 @@ class Pcloud:
         return triangulation
     
     
-    def fit_surface_to_points(
+    def _fit_surface_pipeline(
         self,
-        method: Literal["weighted_avg", "quadric", "rbf", "bspline"] = "weighted_avg",
+        interp_func: Callable[..., Tuple[np.ndarray, np.ndarray]],
         plane: Optional[gkp.Plane] = None,
         spacing: Optional[float] = None,
         n_elements: Optional[int] = None,
         boundary: Literal["convex", "concave"] = "convex",
         concave_ratio: float = 0.3,
         spline: bool = False,
-        **kwargs,
+        **interp_kwargs,
     ) -> Trimesh3d:
-        """Fits a 3D surface mesh to the point cloud using the chosen surface interpolation method.
+        """Shared pipeline for fitting a 3D surface mesh to the point cloud.
 
-        Pipeline:
-        1. Projects points onto a best-fit plane (computed via PCA if plane is None).
-        2. Computes the 2D boundary polygon (convex or concave hull, optionally smoothed).
-        3. Generates a regular 2D grid masked inside the boundary polygon.
-        4. Interpolates elevations w = f(u, v) using the chosen method:
-           - 'weighted_avg': Distance-weighted averaging (IDW, Gaussian, Exponential, Uniform).
-           - 'quadric': Polynomial surface fitting (degree 2 or 3).
-           - 'rbf': Radial Basis Functions (thin-plate spline, multiquadric, etc.) with smoothing.
-           - 'bspline': Smooth bivariate splines (SmoothBivariateSpline) with noise filtering.
-        5. Triangulates the grid and transforms the mesh back to world 3D coordinates.
-
-        Args:
-            method (Literal["weighted_avg", "quadric", "rbf", "bspline"], optional):
-                Surface fitting algorithm to use. Defaults to "weighted_avg".
-            plane (Optional[gkp.Plane], optional): Orientation plane. If None, fitted via PCA.
-            spacing (Optional[float], optional): Target grid node spacing in projection plane.
-            n_elements (Optional[int], optional): Number of grid intervals per axis. Defaults to 50 if spacing is None.
-            boundary (Literal["convex", "concave"], optional): Boundary hull type. Defaults to "convex".
-            concave_ratio (float, optional): Concavity ratio (0.0 to 1.0) when boundary='concave'. Defaults to 0.3.
-            spline (bool, optional): Whether to smooth the boundary polygon with a B-spline. Defaults to False.
-            **kwargs: Method-specific parameters:
-                - For 'weighted_avg': k_neighbors, weighting ('idw'/'gaussian'/'exponential'/'uniform'),
-                  power, sigma, scale, max_distance.
-                - For 'quadric': degree (2 or 3, default 2).
-                - For 'rbf': function ('thin_plate'/'multiquadric'/'cubic'/'gaussian'/'linear', default 'thin_plate'),
-                  smooth (float, default 0.0).
-                - For 'bspline': s (smoothing factor, float or None), kx (int, default 3), ky (int, default 3).
-
-        Returns:
-            Trimesh3d: Triangulated surface mesh containing vertices and faces.
+        Projects points to local plane coordinates, builds boundary polygon,
+        generates masked grid, calls interp_func to obtain grid Z, and reconstructs Trimesh3d.
         """
         if plane is None:
             pl, _ = self.fit_plane_to_points(method="pca")
         else:
             pl = plane
 
-        # 1. Project points onto local plane frame (u, v, w)
         temp_xyz = self.project_points_on_plane(pl)
         sample_xy = temp_xyz[:, :2]
         sample_z = temp_xyz[:, 2]
 
-        # 2. Compute 2D boundary polygon (convex or concave)
         boundary_poly = compute_surface_boundary_polygon(
             sample_xy,
             boundary=boundary,
@@ -2181,71 +2158,19 @@ class Pcloud:
             spline=spline,
         )
 
-        # 3. Build regular grid masked inside the boundary
         grid_xy = generate_masked_surface_grid(
             boundary_poly,
             spacing=spacing,
             n_elements=n_elements,
         )
 
-        # 4. Interpolate elevations using chosen method
-        if method == "weighted_avg":
-            k_neighbors = kwargs.pop("closest_nelems", kwargs.pop("k_neighbors", 10))
-            weighting = kwargs.pop("weighting", "idw")
-            power = kwargs.pop("power", 2.0)
-            sigma = kwargs.pop("sigma", None)
-            scale = kwargs.pop("scale", None)
-            max_distance = kwargs.pop("max_distance", None)
-            valid_grid_xy, grid_z = interpolate_surface_z_weighted_avg(
-                sample_xy=sample_xy,
-                sample_z=sample_z,
-                query_xy=grid_xy,
-                k_neighbors=k_neighbors,
-                weighting=weighting,
-                power=power,
-                sigma=sigma,
-                scale=scale,
-                max_distance=max_distance,
-            )
-        elif method == "quadric":
-            degree = kwargs.pop("degree", 2)
-            valid_grid_xy, grid_z = interpolate_surface_z_quadric(
-                sample_xy=sample_xy,
-                sample_z=sample_z,
-                query_xy=grid_xy,
-                degree=degree,
-            )
-        elif method == "rbf":
-            function = kwargs.pop("function", "thin_plate")
-            smooth = kwargs.pop("smooth", 0.0)
-            valid_grid_xy, grid_z = interpolate_surface_z_rbf(
-                sample_xy=sample_xy,
-                sample_z=sample_z,
-                query_xy=grid_xy,
-                function=function,
-                smooth=smooth,
-                **kwargs,
-            )
-        elif method == "bspline":
-            s = kwargs.pop("s", None)
-            kx = kwargs.pop("kx", 3)
-            ky = kwargs.pop("ky", 3)
-            valid_grid_xy, grid_z = interpolate_surface_z_bspline(
-                sample_xy=sample_xy,
-                sample_z=sample_z,
-                query_xy=grid_xy,
-                s=s,
-                kx=kx,
-                ky=ky,
-                **kwargs,
-            )
-        else:
-            raise ValueError(
-                f"Unknown surface fitting method: '{method}'. "
-                f"Supported methods: 'weighted_avg', 'quadric', 'rbf', 'bspline'."
-            )
+        valid_grid_xy, grid_z = interp_func(
+            sample_xy=sample_xy,
+            sample_z=sample_z,
+            query_xy=grid_xy,
+            **interp_kwargs,
+        )
 
-        # 5. Triangulate and transform back to world coordinates
         mesh = build_transformed_trimesh3d(
             grid_xy=valid_grid_xy,
             grid_z=grid_z,
@@ -2255,7 +2180,130 @@ class Pcloud:
 
         return mesh
 
-    def fit_with_weighted_avg(
+    def fit_surface_z_quadric(
+        self,
+        plane: Optional[gkp.Plane] = None,
+        spacing: Optional[float] = None,
+        n_elements: Optional[int] = None,
+        boundary: Literal["convex", "concave"] = "convex",
+        concave_ratio: float = 0.3,
+        spline: bool = False,
+        degree: int = 2,
+        **kwargs,
+    ) -> Trimesh3d:
+        """Fits a 3D surface mesh to the point cloud using polynomial (quadric or cubic) fitting.
+
+        Args:
+            plane (Optional[gkp.Plane], optional): Orientation plane. If None, fitted via PCA.
+            spacing (Optional[float], optional): Target grid node spacing.
+            n_elements (Optional[int], optional): Number of grid intervals per axis. Defaults to 50 if spacing is None.
+            boundary (Literal["convex", "concave"], optional): Boundary hull type. Defaults to "convex".
+            concave_ratio (float, optional): Concavity ratio when boundary='concave'. Defaults to 0.3.
+            spline (bool, optional): Whether to smooth the boundary polygon. Defaults to False.
+            degree (int, optional): Polynomial degree (2 for quadric, 3 for cubic). Defaults to 2.
+            **kwargs: Extra parameters.
+
+        Returns:
+            Trimesh3d: Triangulated surface mesh.
+        """
+        return self._fit_surface_pipeline(
+            interp_func=fit_surface_z_quadric,
+            plane=plane,
+            spacing=spacing,
+            n_elements=n_elements,
+            boundary=boundary,
+            concave_ratio=concave_ratio,
+            spline=spline,
+            degree=degree,
+            **kwargs,
+        )
+
+    def fit_surface_z_rbf(
+        self,
+        plane: Optional[gkp.Plane] = None,
+        spacing: Optional[float] = None,
+        n_elements: Optional[int] = None,
+        boundary: Literal["convex", "concave"] = "convex",
+        concave_ratio: float = 0.3,
+        spline: bool = False,
+        function: str = "thin_plate",
+        smooth: float = 0.0,
+        **kwargs,
+    ) -> Trimesh3d:
+        """Fits a 3D surface mesh to the point cloud using Radial Basis Functions with optional smoothing.
+
+        Args:
+            plane (Optional[gkp.Plane], optional): Orientation plane. If None, fitted via PCA.
+            spacing (Optional[float], optional): Target grid node spacing.
+            n_elements (Optional[int], optional): Number of grid intervals per axis. Defaults to 50 if spacing is None.
+            boundary (Literal["convex", "concave"], optional): Boundary hull type. Defaults to "convex".
+            concave_ratio (float, optional): Concavity ratio when boundary='concave'. Defaults to 0.3.
+            spline (bool, optional): Whether to smooth the boundary polygon. Defaults to False.
+            function (str, optional): RBF kernel ('thin_plate', 'multiquadric', 'linear', 'cubic', 'gaussian').
+            smooth (float, optional): Smoothing parameter (>= 0). Defaults to 0.0.
+            **kwargs: Extra parameters passed to RBF.
+
+        Returns:
+            Trimesh3d: Triangulated surface mesh.
+        """
+        return self._fit_surface_pipeline(
+            interp_func=fit_surface_z_rbf,
+            plane=plane,
+            spacing=spacing,
+            n_elements=n_elements,
+            boundary=boundary,
+            concave_ratio=concave_ratio,
+            spline=spline,
+            function=function,
+            smooth=smooth,
+            **kwargs,
+        )
+
+    def fit_surface_z_bspline(
+        self,
+        plane: Optional[gkp.Plane] = None,
+        spacing: Optional[float] = None,
+        n_elements: Optional[int] = None,
+        boundary: Literal["convex", "concave"] = "convex",
+        concave_ratio: float = 0.3,
+        spline: bool = False,
+        s: Optional[float] = None,
+        kx: int = 3,
+        ky: int = 3,
+        **kwargs,
+    ) -> Trimesh3d:
+        """Fits a 3D surface mesh to the point cloud using SmoothBivariateSpline with noise smoothing.
+
+        Args:
+            plane (Optional[gkp.Plane], optional): Orientation plane. If None, fitted via PCA.
+            spacing (Optional[float], optional): Target grid node spacing.
+            n_elements (Optional[int], optional): Number of grid intervals per axis. Defaults to 50 if spacing is None.
+            boundary (Literal["convex", "concave"], optional): Boundary hull type. Defaults to "convex".
+            concave_ratio (float, optional): Concavity ratio when boundary='concave'. Defaults to 0.3.
+            spline (bool, optional): Whether to smooth the boundary polygon. Defaults to False.
+            s (Optional[float], optional): Smoothing factor.
+            kx (int, optional): Spline degree in x. Defaults to 3.
+            ky (int, optional): Spline degree in y. Defaults to 3.
+            **kwargs: Extra parameters.
+
+        Returns:
+            Trimesh3d: Triangulated surface mesh.
+        """
+        return self._fit_surface_pipeline(
+            interp_func=fit_surface_z_bspline,
+            plane=plane,
+            spacing=spacing,
+            n_elements=n_elements,
+            boundary=boundary,
+            concave_ratio=concave_ratio,
+            spline=spline,
+            s=s,
+            kx=kx,
+            ky=ky,
+            **kwargs,
+        )
+
+    def fit_surface_z_weighted_avg(
         self,
         plane: Optional[gkp.Plane] = None,
         spacing: Optional[float] = None,
@@ -2273,10 +2321,30 @@ class Pcloud:
     ) -> Trimesh3d:
         """Fits a 3D surface to the point cloud using distance-weighted averaging.
 
-        Convenience wrapper delegating to fit_surface_to_points(method='weighted_avg').
+        Args:
+            plane (Optional[gkp.Plane], optional): Orientation plane. If None, fitted via PCA.
+            spacing (Optional[float], optional): Target grid node spacing.
+            n_elements (Optional[int], optional): Number of grid intervals per axis. Defaults to 50 if spacing is None.
+            boundary (Literal["convex", "concave"], optional): Boundary hull type. Defaults to "convex".
+            concave_ratio (float, optional): Concavity ratio when boundary='concave'. Defaults to 0.3.
+            spline (bool, optional): Whether to smooth the boundary polygon. Defaults to False.
+            k_neighbors (int, optional): Number of nearest neighbors. Defaults to 10.
+            weighting (Literal["idw", "gaussian", "exponential", "uniform"], optional):
+                Weighting kernel. Defaults to "idw".
+            power (float, optional): Exponent for IDW weighting. Defaults to 2.0.
+            sigma (Optional[float], optional): Gaussian kernel width.
+            scale (Optional[float], optional): Exponential kernel decay scale.
+            max_distance (Optional[float], optional): Maximum search radius cutoff.
+            **kwargs: Extra parameters (e.g. closest_nelems alias for k_neighbors).
+
+        Returns:
+            Trimesh3d: Triangulated surface mesh containing vertices and faces.
         """
-        return self.fit_surface_to_points(
-            method="weighted_avg",
+        if "closest_nelems" in kwargs and kwargs["closest_nelems"] is not None:
+            k_neighbors = kwargs.pop("closest_nelems")
+
+        return self._fit_surface_pipeline(
+            interp_func=fit_surface_z_weighted_avg,
             plane=plane,
             spacing=spacing,
             n_elements=n_elements,
@@ -2291,6 +2359,92 @@ class Pcloud:
             max_distance=max_distance,
             **kwargs,
         )
+
+    # Aliases inside Pcloud with 'interpolate' and 'fit_with_' prefixes
+    interpolate_surface_z_weighted_avg = fit_surface_z_weighted_avg
+    interpolate_surface_z_quadric = fit_surface_z_quadric
+    interpolate_surface_z_rbf = fit_surface_z_rbf
+    interpolate_surface_z_bspline = fit_surface_z_bspline
+
+    fit_with_weighted_avg = fit_surface_z_weighted_avg
+    fit_with_quadric = fit_surface_z_quadric
+    fit_with_rbf = fit_surface_z_rbf
+    fit_with_bspline = fit_surface_z_bspline
+
+    def fit_surface_to_points(
+        self,
+        method: Literal["weighted_avg", "quadric", "rbf", "bspline"] = "weighted_avg",
+        plane: Optional[gkp.Plane] = None,
+        spacing: Optional[float] = None,
+        n_elements: Optional[int] = None,
+        boundary: Literal["convex", "concave"] = "convex",
+        concave_ratio: float = 0.3,
+        spline: bool = False,
+        **kwargs,
+    ) -> Trimesh3d:
+        """Fits a 3D surface mesh to the point cloud using the chosen surface interpolation method.
+
+        Calls the corresponding fit_surface_z_* method on Pcloud.
+
+        Args:
+            method (Literal["weighted_avg", "quadric", "rbf", "bspline"], optional):
+                Surface fitting algorithm to use. Defaults to "weighted_avg".
+            plane (Optional[gkp.Plane], optional): Orientation plane. If None, fitted via PCA.
+            spacing (Optional[float], optional): Target grid node spacing in projection plane.
+            n_elements (Optional[int], optional): Number of grid intervals per axis. Defaults to 50 if spacing is None.
+            boundary (Literal["convex", "concave"], optional): Boundary hull type. Defaults to "convex".
+            concave_ratio (float, optional): Concavity ratio (0.0 to 1.0) when boundary='concave'. Defaults to 0.3.
+            spline (bool, optional): Whether to smooth the boundary polygon with a B-spline. Defaults to False.
+            **kwargs: Method-specific parameters forwarded to the chosen fit_surface_z_* method.
+
+        Returns:
+            Trimesh3d: Triangulated surface mesh containing vertices and faces.
+        """
+        if method in ("weighted_avg", "idw"):
+            return self.fit_surface_z_weighted_avg(
+                plane=plane,
+                spacing=spacing,
+                n_elements=n_elements,
+                boundary=boundary,
+                concave_ratio=concave_ratio,
+                spline=spline,
+                **kwargs,
+            )
+        elif method in ("quadric", "polynomial"):
+            return self.fit_surface_z_quadric(
+                plane=plane,
+                spacing=spacing,
+                n_elements=n_elements,
+                boundary=boundary,
+                concave_ratio=concave_ratio,
+                spline=spline,
+                **kwargs,
+            )
+        elif method == "rbf":
+            return self.fit_surface_z_rbf(
+                plane=plane,
+                spacing=spacing,
+                n_elements=n_elements,
+                boundary=boundary,
+                concave_ratio=concave_ratio,
+                spline=spline,
+                **kwargs,
+            )
+        elif method in ("bspline", "spline"):
+            return self.fit_surface_z_bspline(
+                plane=plane,
+                spacing=spacing,
+                n_elements=n_elements,
+                boundary=boundary,
+                concave_ratio=concave_ratio,
+                spline=spline,
+                **kwargs,
+            )
+        else:
+            raise ValueError(
+                f"Unknown surface fitting method: '{method}'. "
+                f"Supported methods: 'weighted_avg', 'quadric', 'rbf', 'bspline'."
+            )
 
 if not hasattr(pd.DataFrame, "pcloud"):
     pd.api.extensions.register_dataframe_accessor("pcloud")(Pcloud)

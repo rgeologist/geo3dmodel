@@ -61,6 +61,30 @@ model = Model3D_plotly()
 # (Add your traces and render)
 ```
 
+### Fitting Planes & Surfaces from Point Clouds (`Pcloud`)
+You can use the `df.pcloud` Pandas accessor to fit planes, polynomial surfaces, and regularized splines directly to 3D point cloud DataFrames:
+
+```python
+import pandas as pd
+import geo3dmodel
+
+# Given a DataFrame df with ['x', 'y', 'z'] coordinates:
+
+# 1. Fit a plane using RANSAC (noise-robust) or PCA / SVD / least_squares
+plane, rmse = df.pcloud.fit_plane_to_points(
+    method="ransac", distance_threshold=0.05, residual_type="orthogonal_rmse"
+)
+print(f"Dip: {plane.dip:.1f}°, Dip Azimuth: {plane.dip_azimuth:.1f}°")
+
+# 2. Compute signed perpendicular distances (does not mutate df)
+residuals = df.pcloud.distance_to_plane(plane, signed=True)
+
+# 3. Fit irregular surfaces with noise-tolerant methods:
+mesh_quad = df.pcloud.fit_surface_to_points(method="quadric", degree=2, n_elements=40)
+mesh_rbf = df.pcloud.fit_surface_to_points(method="rbf", function="thin_plate", smooth=0.1)
+mesh_spline = df.pcloud.fit_surface_to_points(method="bspline", s=5.0)
+```
+
 ## 🧪 Running Tests
 
 This project comes with a comprehensive unit test suite leveraging `pytest`. To run the tests, simply execute:

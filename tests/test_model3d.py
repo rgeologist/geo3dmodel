@@ -26,6 +26,10 @@ from geo3dmodel.model3d import (
     build_vertical_surface,
     compute_surface_boundary_polygon,
     generate_masked_surface_grid,
+    fit_surface_z_weighted_avg,
+    fit_surface_z_quadric,
+    fit_surface_z_rbf,
+    fit_surface_z_bspline,
     interpolate_surface_z_weighted_avg,
     interpolate_surface_z_quadric,
     interpolate_surface_z_rbf,
@@ -277,6 +281,59 @@ class TestModel3D(unittest.TestCase):
         self.assertIsInstance(dists, pd.Series)
         self.assertEqual(len(dists), 3)
         self.assertEqual(list(df.columns), orig_cols)
+
+    def test_pcloud_fit_surface_z_individual_methods(self):
+        np.random.seed(42)
+        x = np.random.uniform(-5, 5, 60)
+        y = np.random.uniform(-5, 5, 60)
+        z = 0.1 * x**2 + 0.1 * y**2
+        df = pd.DataFrame({"x": x, "y": y, "z": z})
+
+        mesh_quad = df.pcloud.fit_surface_z_quadric(n_elements=10)
+        self.assertIsInstance(mesh_quad, Trimesh3d)
+
+        mesh_rbf = df.pcloud.fit_surface_z_rbf(n_elements=10, smooth=0.1)
+        self.assertIsInstance(mesh_rbf, Trimesh3d)
+
+        mesh_bspline = df.pcloud.fit_surface_z_bspline(n_elements=10)
+        self.assertIsInstance(mesh_bspline, Trimesh3d)
+
+        mesh_wavg = df.pcloud.fit_surface_z_weighted_avg(n_elements=10)
+        self.assertIsInstance(mesh_wavg, Trimesh3d)
+
+    def test_pcloud_interpolate_surface_z_aliases(self):
+        df = pd.DataFrame({
+            "x": [0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+            "y": [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            "z": [0.0, 0.1, 0.2, 0.1, 0.2, 0.3],
+        })
+
+        mesh_interp_quad = df.pcloud.interpolate_surface_z_quadric(n_elements=5)
+        self.assertIsInstance(mesh_interp_quad, Trimesh3d)
+
+        mesh_interp_rbf = df.pcloud.interpolate_surface_z_rbf(n_elements=5)
+        self.assertIsInstance(mesh_interp_rbf, Trimesh3d)
+
+        mesh_interp_bspline = df.pcloud.interpolate_surface_z_bspline(n_elements=5)
+        self.assertIsInstance(mesh_interp_bspline, Trimesh3d)
+
+        mesh_interp_wavg = df.pcloud.interpolate_surface_z_weighted_avg(n_elements=5)
+        self.assertIsInstance(mesh_interp_wavg, Trimesh3d)
+
+        mesh_with_quad = df.pcloud.fit_with_quadric(n_elements=5)
+        self.assertIsInstance(mesh_with_quad, Trimesh3d)
+
+        mesh_with_rbf = df.pcloud.fit_with_rbf(n_elements=5)
+        self.assertIsInstance(mesh_with_rbf, Trimesh3d)
+
+        mesh_with_bspline = df.pcloud.fit_with_bspline(n_elements=5)
+        self.assertIsInstance(mesh_with_bspline, Trimesh3d)
+
+    def test_module_level_surface_z_aliases(self):
+        self.assertIs(interpolate_surface_z_quadric, fit_surface_z_quadric)
+        self.assertIs(interpolate_surface_z_rbf, fit_surface_z_rbf)
+        self.assertIs(interpolate_surface_z_bspline, fit_surface_z_bspline)
+        self.assertIs(interpolate_surface_z_weighted_avg, fit_surface_z_weighted_avg)
 
     @unittest.skipIf(not HAS_OPEN3D, "open3d not installed")
     def test_open3d_feature(self):
