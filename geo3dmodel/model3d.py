@@ -1126,10 +1126,13 @@ def generate_stereonet_grid_lonlat(
         lat_rad = np.full(npoints, np.radians(lat_deg))
         grid_lines.append((lon_range, lat_rad, "parallel"))
 
-    # 3. Primitive bounding circle
-    theta = np.linspace(0, 2 * np.pi, 360)
-    prim_lon = np.sin(theta) * (np.pi / 2)
-    prim_lat = np.cos(theta) * (np.pi / 2)
+    # 3. Primitive bounding circle (outer boundary of visible hemisphere: lon = ±90°)
+    lat_east = np.linspace(-np.pi / 2, np.pi / 2, npoints)
+    lon_east = np.full(npoints, np.pi / 2)
+    lat_west = np.linspace(np.pi / 2, -np.pi / 2, npoints)
+    lon_west = np.full(npoints, -np.pi / 2)
+    prim_lon = np.concatenate([lon_east, lon_west])
+    prim_lat = np.concatenate([lat_east, lat_west])
     grid_lines.append((prim_lon, prim_lat, "primitive"))
 
     # 4. Central crosshairs

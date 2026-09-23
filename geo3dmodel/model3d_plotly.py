@@ -24,6 +24,9 @@ from plotly.offline import plot as offline_plot
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+import matplotlib.tri as tri
+import matplotlib.path as mplpath
+from scipy.interpolate import splprep, splev
 from shapely import LineString
 import xarray as xr
 
@@ -1538,7 +1541,8 @@ def build_point_cloud_figure(
         margin=dict(l=0, r=0, t=30 if title else 0, b=0),
         scene=dict(
             dragmode=dragmode,
-            camera=get_default_camera()
+            camera=get_default_camera(),
+            uirevision=uirevision
         )
     )
     if title:
@@ -1645,70 +1649,232 @@ def build_selection_plane_figure(
 
 def build_stereonet_figure(
     projection: str = "equal_area",
+    grid_type: str = "stereonet",
     step_deg: int = 10,
-    title: str = "Stereonet (Schmidt Equal-Area)"
+    title: str = "Stereonet"
 ) -> go.Figure:
-    """Build the static stereonet grid figure in pure Plotly."""
-    grid_lines = m3d.generate_stereonet_grid_lonlat(step_deg=step_deg)
-    proj_fn = project_lambert if projection == "equal_area" else project_stereographic
+    """Build the stereonet figure in Plotly delegating to geokitpy.stereonet.Stereonet."""
+    proj = "polar" if projection == "polar" else ("wulff" if projection in ["equal_angle", "wulff"] else "schmidt")
+    grid = "polar" if grid_type == "polar" else "equatorial"
 
-    traces = []
-    for lons, lats, kind in grid_lines:
-        x, y = proj_fn(lons, lats)
-        if kind == "primitive":
-            traces.append(go.Scatter(
-                x=x, y=y, mode="lines",
-                line=dict(color="#ffffff", width=2),
-                hoverinfo="none", showlegend=False
-            ))
-        elif kind == "crosshair":
-            traces.append(go.Scatter(
-                x=x, y=y, mode="lines",
-                line=dict(color="#666677", width=1.2, dash="dash"),
-                hoverinfo="none", showlegend=False
-            ))
-        else:
-            traces.append(go.Scatter(
-                x=x, y=y, mode="lines",
-                line=dict(color="#3a3a4e", width=0.8),
-                hoverinfo="none", showlegend=False
-            ))
+    snet = gkp.Stereonet(
+        projection=proj,
+        backend="plotly",
+        grid=True,
+        grid_type=[grid, "crosshairs"],
+        grid_step=step_deg,
+        equatorial_style={"color": "#3a3a4e", "linewidth": 0.8},
+        polar_style={"color": "#3a3a4e", "linewidth": 0.8, "dash": "solid"},
+        crosshair_style={"color": "#666677", "linewidth": 1.2, "dash": "dash"},
+        ticks=False,
+    )
+    fig = snet.fig
 
-    cardinal_annotations = [
-        dict(x=0, y=1.07, text="<b>N</b>", showarrow=False, font=dict(color="#ffffff", size=14)),
-        dict(x=1.07, y=0, text="<b>E</b>", showarrow=False, font=dict(color="#ffffff", size=14)),
-        dict(x=0, y=-1.07, text="<b>S</b>", showarrow=False, font=dict(color="#ffffff", size=14)),
-        dict(x=-1.07, y=0, text="<b>W</b>", showarrow=False, font=dict(color="#ffffff", size=14)),
-    ]
-
-    fig = go.Figure(data=traces)
+    # Apply dark theme styling to match the GUI layout
     fig.update_layout(
-        title=dict(text=title, font=dict(color="#ffffff", size=13), x=0.5, xanchor="center"),
-        annotations=cardinal_annotations,
-        margin=dict(l=20, r=20, t=40, b=20),
+        autosize=True,
+        width=None,
+        height=None,
+        plot_bgcolor="#1e1e28",
+        paper_bgcolor="#1e1e28",
+        title=dict(text=title, font=dict(color="#ffffff", size=13), x=0.5, xanchor="center") if title else None,
+        margin=dict(l=10, r=10, t=25 if title else 10, b=10),
         xaxis=dict(
             visible=False,
             range=[-1.18, 1.18],
-            fixedrange=True
+            fixedrange=True,
+            showgrid=False,
+            zeroline=False,
+            scaleanchor="y",
+            scaleratio=1,
         ),
         yaxis=dict(
             visible=False,
             range=[-1.18, 1.18],
             fixedrange=True,
-            scaleanchor="x",
-            scaleratio=1
+            showgrid=False,
+            zeroline=False,
         ),
-        plot_bgcolor="#1e1e28",
-        paper_bgcolor="#1e1e28",
-        showlegend=False
+        showlegend=False,
     )
+
+    if fig.layout.annotations:
+        for ann in fig.layout.annotations:
+            ann.font = dict(color="#ffffff", size=14)
+
+    if fig.layout.shapes:
+        for sh in fig.layout.shapes:
+            if getattr(sh, "type", "") == "circle":
+                sh.line = dict(color="#ffffff", width=2)
+
     return fig
+
+def create_plane_hull_traces(
+    points: Optional[ArrayLike] = None,
+    strike: float = 0.0,
+    dip: float = 0.0,
+    center: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    radius: float = 1.0,
+    render_mode: Literal["convex", "concave", "spline", "disk"] = "convex",
+    concave_ratio: float = 0.30,
+    color: str = "#636efa",
+    opacity: float = 0.45,
+    name: str = "Plane",
+    draw_outline: bool = True,
+    outline_color: Optional[str] = None,
+    outline_width: float = 2.5,
+    num_sides: int = 36,
+    custom_info: Optional[str] = None,
+) -> Tuple[go.Mesh3d, Optional[go.Scatter3d]]:
+    """Build a 3D Mesh3d surface (Convex Hull, Concave Hull, Spline, or Disk) and outline for a plane.
+
+    Args:
+        points: (N, 3) coordinates of the cluster points defining the hull.
+        strike: Strike angle in degrees (Right-Hand-Rule).
+        dip: Dip angle in degrees (0 to 90).
+        center: 3D center / centroid coordinates (x, y, z).
+        radius: Fallback radius if disk mode is used or points is insufficient.
+        render_mode: Hull type ('convex', 'concave', 'spline', 'disk'). Defaults to 'convex'.
+        concave_ratio: Alpha concavity ratio (0.05 - 1.0) when render_mode='concave'.
+        color: Mesh surface color hex or rgba string.
+        opacity: Opacity for the mesh surface (0.0 - 1.0).
+        name: Name of the plane trace.
+        draw_outline: Whether to include a Scatter3d perimeter outline trace.
+        outline_color: Color of the perimeter line (defaults to color).
+        outline_width: Line width of perimeter outline.
+        num_sides: Number of sides when falling back to circular disk.
+        custom_info: Extra text for hovertemplate.
+
+    Returns:
+        Tuple of (go.Mesh3d, Optional[go.Scatter3d]).
+    """
+    center_arr = np.asarray(center, dtype=float)
+    pts_arr = np.asarray(points, dtype=float) if points is not None else None
+
+    # Fallback to circular disk if requested or if point cloud has < 3 points
+    if render_mode == "disk" or pts_arr is None or len(pts_arr) < 3:
+        disk, triangles = m3d.build_disk(
+            strike=float(strike),
+            dip=float(dip),
+            center=tuple(center),
+            radius=float(radius),
+            num_sides=int(num_sides)
+        )
+        mesh_verts = disk
+        tri_i, tri_j, tri_k = triangles.T
+        outline_verts = disk
+    else:
+        plane = gkp.Plane(float(strike), float(dip))
+        rot_matrix = plane.axes.as_matrix.T
+        change_base_matrix = np.linalg.inv(rot_matrix)
+
+        # Local coordinates on plane reference frame: z is normal, (x, y) are in-plane
+        local_xyz = np.matmul(change_base_matrix, (pts_arr - center_arr).T).T
+        local_uv = local_xyz[:, :2]
+
+        # 1. Compute 2D boundary polygon in plane space
+        try:
+            if render_mode == "concave":
+                ratio = max(0.01, min(1.0, float(concave_ratio)))
+                poly_2d = gkp.geogis.concave_hull_2d(local_uv, ratio=ratio, as_array=True)
+                if len(poly_2d) < 3:
+                    poly_2d = gkp.geogis.convex_hull_2d(local_uv, as_array=True)
+            else:
+                poly_2d = gkp.geogis.convex_hull_2d(local_uv, as_array=True)
+
+            if render_mode == "spline" and len(poly_2d) >= 4:
+                try:
+                    coords_for_spline = poly_2d[:-1] if np.allclose(poly_2d[0], poly_2d[-1]) else poly_2d
+                    tck, u_spl = splprep(coords_for_spline.T, u=None, s=0.0, per=1)
+                    u_new = np.linspace(u_spl.min(), u_spl.max(), 100)
+                    x_new, y_new = splev(u_new, tck, der=0)
+                    poly_2d = np.column_stack((x_new, y_new))
+                except Exception:
+                    pass
+        except Exception:
+            poly_2d = gkp.geogis.convex_hull_2d(local_uv, as_array=True)
+
+        # 2. Triangulate planar polygon using 2D Delaunay
+        all_uv = np.unique(np.vstack((poly_2d, local_uv)), axis=0)
+        try:
+            triang = tri.Triangulation(all_uv[:, 0], all_uv[:, 1])
+            triangles = triang.triangles
+
+            # In concave or spline mode, mask triangles whose centroids fall outside the polygon
+            if render_mode in ("concave", "spline") and len(poly_2d) >= 3:
+                tri_centroids = all_uv[triangles].mean(axis=1)
+                path = mplpath.Path(poly_2d)
+                inside_mask = path.contains_points(tri_centroids)
+                if np.any(inside_mask):
+                    triangles = triangles[inside_mask]
+
+            tri_i, tri_j, tri_k = triangles.T
+            local_mesh_3d = np.column_stack((all_uv, np.zeros(len(all_uv))))
+            mesh_verts = np.matmul(rot_matrix, local_mesh_3d.T).T + center_arr
+        except Exception:
+            # Fallback to single polygon fan if Delaunay fails on degenerate geometry
+            n_poly = len(poly_2d)
+            tri_i = np.zeros(n_poly - 2, dtype=int)
+            tri_j = np.arange(1, n_poly - 1, dtype=int)
+            tri_k = np.arange(2, n_poly, dtype=int)
+            local_mesh_3d = np.column_stack((poly_2d, np.zeros(len(poly_2d))))
+            mesh_verts = np.matmul(rot_matrix, local_mesh_3d.T).T + center_arr
+
+        # 3. Compute 3D boundary outline
+        local_outline_3d = np.column_stack((poly_2d, np.zeros(len(poly_2d))))
+        outline_verts = np.matmul(rot_matrix, local_outline_3d.T).T + center_arr
+
+    mode_label = {
+        "convex": "Convex Hull",
+        "concave": f"Concave Hull ({concave_ratio:.2f})",
+        "spline": "Spline Hull",
+        "disk": "Circular Disk"
+    }.get(render_mode, "Plane")
+
+    hovertemplate = (
+        f"<b>{name}</b> ({mode_label})<br>"
+        f"Strike: {strike:.1f}°<br>"
+        f"Dip: {dip:.1f}°"
+    )
+    if custom_info:
+        hovertemplate += f"<br>{custom_info}"
+    hovertemplate += "<extra></extra>"
+
+    mesh_trace = go.Mesh3d(
+        x=mesh_verts[:, 0],
+        y=mesh_verts[:, 1],
+        z=mesh_verts[:, 2],
+        i=tri_i,
+        j=tri_j,
+        k=tri_k,
+        color=color,
+        opacity=opacity,
+        name=name,
+        hovertemplate=hovertemplate,
+        showlegend=False,
+    )
+
+    outline_trace = None
+    if draw_outline and len(outline_verts) > 1:
+        outline_c = outline_color or color
+        outline_trace = go.Scatter3d(
+            x=outline_verts[:, 0],
+            y=outline_verts[:, 1],
+            z=outline_verts[:, 2],
+            mode="lines",
+            line=dict(color=outline_c, width=outline_width),
+            name=f"{name} outline",
+            hoverinfo="none",
+            showlegend=False,
+        )
+
+    return mesh_trace, outline_trace
 
 
 def create_plane_disk_traces(
     strike: float,
     dip: float,
-    center: Sequence[float],
+    center: Tuple[float, float, float],
     radius: float = 1.0,
     color: str = "#636efa",
     opacity: float = 0.45,
@@ -1721,48 +1887,88 @@ def create_plane_disk_traces(
 ) -> Tuple[go.Mesh3d, Optional[go.Scatter3d]]:
     """Build a 3D Mesh3d disk and optional Scatter3d perimeter outline for a structural plane.
 
+    Preserved for backwards compatibility, forwards to create_plane_hull_traces(render_mode='disk').
+    """
+    return create_plane_hull_traces(
+        points=None,
+        strike=strike,
+        dip=dip,
+        center=center,
+        radius=radius,
+        render_mode="disk",
+        color=color,
+        opacity=opacity,
+        name=name,
+        draw_outline=draw_outline,
+        outline_color=outline_color,
+        outline_width=outline_width,
+        num_sides=num_sides,
+        custom_info=custom_info
+    )
+
+
+def create_surface_mesh_traces(
+    mesh: Any,
+    color: str = "#636efa",
+    opacity: float = 0.55,
+    name: str = "Surface",
+    draw_outline: bool = True,
+    outline_color: Optional[str] = None,
+    outline_width: float = 2.5,
+    custom_info: Optional[str] = None,
+) -> Tuple[go.Mesh3d, Optional[go.Scatter3d]]:
+    """Build a 3D Mesh3d surface and optional Scatter3d perimeter outline for a Trimesh3d surface.
+
     Args:
-        strike: Strike angle in degrees (Right-Hand-Rule).
-        dip: Dip angle in degrees (0 to 90).
-        center: 3D center coordinates (x, y, z).
-        radius: Radius of the disk in dataset units.
+        mesh: Trimesh3d or object with .vertices (N, 3) and .faces/.triangles (M, 3), or tuple (vertices, faces).
         color: Mesh surface color hex or rgba string.
         opacity: Opacity for the mesh surface (0.0 - 1.0).
-        name: Name of the plane trace.
-        draw_outline: Whether to include a Scatter3d perimeter trace.
+        name: Name of the surface trace.
+        draw_outline: Whether to include a Scatter3d perimeter outline trace.
         outline_color: Color of the perimeter line (defaults to color).
         outline_width: Line width of perimeter outline.
-        num_sides: Number of segments for the circular boundary.
-        custom_info: Extra info text for hovertemplate.
+        custom_info: Extra text for hovertemplate.
 
     Returns:
         Tuple of (go.Mesh3d, Optional[go.Scatter3d]).
     """
-    disk, triangles = m3d.build_disk(
-        strike=float(strike),
-        dip=float(dip),
-        center=tuple(center),
-        radius=float(radius),
-        num_sides=int(num_sides)
-    )
-    i, j, k = triangles.T
+    from collections import Counter
+
+    if hasattr(mesh, "vertices") and hasattr(mesh, "faces"):
+        vertices = np.asarray(mesh.vertices, dtype=float)
+        faces = np.asarray(mesh.faces, dtype=int)
+    elif hasattr(mesh, "vertices") and hasattr(mesh, "triangles"):
+        vertices = np.asarray(mesh.vertices, dtype=float)
+        faces = np.asarray(mesh.triangles, dtype=int)
+    elif isinstance(mesh, (tuple, list)) and len(mesh) == 2:
+        vertices = np.asarray(mesh[0], dtype=float)
+        faces = np.asarray(mesh[1], dtype=int)
+    else:
+        raise ValueError("Invalid mesh structure provided to create_surface_mesh_traces.")
+
+    if len(vertices) == 0 or len(faces) == 0:
+        raise ValueError("Surface mesh must contain non-empty vertices and faces.")
+
+    tri_i = faces[:, 0]
+    tri_j = faces[:, 1]
+    tri_k = faces[:, 2]
 
     hovertemplate = (
         f"<b>{name}</b><br>"
-        f"Strike: {strike:.1f}°<br>"
-        f"Dip: {dip:.1f}°"
+        f"Vertices: {len(vertices):,}<br>"
+        f"Triangles: {len(faces):,}"
     )
     if custom_info:
         hovertemplate += f"<br>{custom_info}"
     hovertemplate += "<extra></extra>"
 
     mesh_trace = go.Mesh3d(
-        x=disk[:, 0],
-        y=disk[:, 1],
-        z=disk[:, 2],
-        i=i,
-        j=j,
-        k=k,
+        x=vertices[:, 0],
+        y=vertices[:, 1],
+        z=vertices[:, 2],
+        i=tri_i,
+        j=tri_j,
+        k=tri_k,
         color=color,
         opacity=opacity,
         name=name,
@@ -1771,18 +1977,35 @@ def create_plane_disk_traces(
     )
 
     outline_trace = None
-    if draw_outline:
-        outline_c = outline_color or color
-        outline_trace = go.Scatter3d(
-            x=disk[:, 0],
-            y=disk[:, 1],
-            z=disk[:, 2],
-            mode="lines",
-            line=dict(color=outline_c, width=outline_width),
-            name=f"{name} outline",
-            hoverinfo="none",
-            showlegend=False,
-        )
+    if draw_outline and len(faces) > 0:
+        edges = []
+        for f in faces:
+            edges.append((min(f[0], f[1]), max(f[0], f[1])))
+            edges.append((min(f[1], f[2]), max(f[1], f[2])))
+            edges.append((min(f[2], f[0]), max(f[2], f[0])))
+        counts = Counter(edges)
+        boundary_edges = [edge for edge, count in counts.items() if count == 1]
+
+        if boundary_edges:
+            lines_x: List[Optional[float]] = []
+            lines_y: List[Optional[float]] = []
+            lines_z: List[Optional[float]] = []
+            for u, v in boundary_edges:
+                lines_x.extend([float(vertices[u, 0]), float(vertices[v, 0]), None])
+                lines_y.extend([float(vertices[u, 1]), float(vertices[v, 1]), None])
+                lines_z.extend([float(vertices[u, 2]), float(vertices[v, 2]), None])
+
+            outline_c = outline_color or color
+            outline_trace = go.Scatter3d(
+                x=lines_x,
+                y=lines_y,
+                z=lines_z,
+                mode="lines",
+                line=dict(color=outline_c, width=outline_width),
+                name=f"{name} outline",
+                hoverinfo="none",
+                showlegend=False,
+            )
 
     return mesh_trace, outline_trace
 
@@ -1808,7 +2031,7 @@ def add_pole_to_stereonet(
         dip_azimuth: Dip direction (azimuth) in degrees.
         color: Marker color.
         name: Name for hover tooltip and legend.
-        projection: 'equal_area' (Schmidt) or 'equal_angle' (Wulff).
+        projection: 'equal_area' (Schmidt), 'equal_angle' (Wulff), or 'polar'.
         strike: Optional strike in degrees for hover display.
         residual: Optional residual error for hover display.
         marker_size: Marker radius in pixels.
@@ -1820,10 +2043,11 @@ def add_pole_to_stereonet(
     else:
         calc_strike = strike
 
-    plane = gkp.Plane(calc_strike, dip)
-    lon, lat = plane.to_pole_lonlat()
-    proj_fn = project_lambert if projection == "equal_area" else project_stereographic
-    x, y = proj_fn(lon, lat)
+    proj = "polar" if projection == "polar" else ("wulff" if projection in ["equal_angle", "wulff"] else "schmidt")
+    snet = gkp.Stereonet(projection=proj, backend="plotly", grid=False)
+    from geokitpy.stereonet import pole2plunge_bearing
+    pole_plunge, pole_bearing = pole2plunge_bearing(calc_strike, dip)
+    x, y = snet.to_xy(pole_bearing, pole_plunge)
 
     hover_parts = [f"<b>{name}</b>", f"Dip: {dip:.1f}° ➔ {dip_azimuth:.1f}°", f"Strike: {calc_strike:.1f}°"]
     if residual is not None:
@@ -1831,8 +2055,8 @@ def add_pole_to_stereonet(
     hovertext = "<br>".join(hover_parts)
 
     fig.add_trace(go.Scatter(
-        x=[x],
-        y=[y],
+        x=[float(np.squeeze(x))],
+        y=[float(np.squeeze(y))],
         mode="markers",
         marker=dict(
             size=marker_size,
@@ -1868,16 +2092,18 @@ def add_great_circle_to_stereonet(
         dip: Dip angle in degrees.
         color: Line color.
         name: Name for hover tooltip.
-        projection: 'equal_area' (Schmidt) or 'equal_angle' (Wulff).
+        projection: 'equal_area' (Schmidt), 'equal_angle' (Wulff), or 'polar'.
         line_width: Width of the great circle line.
         dash: Plotly line dash pattern ('solid', 'dash', 'dot').
         npoints: Number of evaluation points along the great circle.
         **kwargs: Extra arguments passed to go.Scatter.
     """
-    plane = gkp.Plane(strike, dip)
-    lons, lats = plane.to_greatcircle_lonlat(npoints=npoints)
-    proj_fn = project_lambert if projection == "equal_area" else project_stereographic
-    x, y = proj_fn(lons, lats)
+    proj = "polar" if projection == "polar" else ("wulff" if projection in ["equal_angle", "wulff"] else "schmidt")
+    snet = gkp.Stereonet(projection=proj, backend="plotly", grid=False)
+    from geokitpy.stereonet import plane, geographic2plunge_bearing
+    lons, lats = plane(strike, dip, segments=npoints)
+    pl, br = geographic2plunge_bearing(lons, lats)
+    x, y = snet.to_xy(br, pl)
 
     hovertext = f"<b>{name}</b><br>Strike: {strike:.1f}° / Dip: {dip:.1f}°"
 
