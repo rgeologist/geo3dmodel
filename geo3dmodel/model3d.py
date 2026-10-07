@@ -1544,6 +1544,124 @@ def build_transformed_trimesh3d(
     return Trimesh3d(vertices=world_vertices, faces=faces)
 
 
+def orientation_confidence_polygon(
+    strikes: ArrayLike,
+    dips: ArrayLike,
+    confidence: float = 0.90,
+    projection: Literal["equal_area", "equal_angle"] = "equal_area",
+    n_boundary_points: int = 60,
+) -> np.ndarray:
+    """Compute the boundary polygon enclosing the densest fraction of orientation poles.
+    
+    Uses kernel density estimation on the stereonet projection plane to find
+    the smallest region containing `confidence` fraction of the input poles.
+    
+    Args:
+        strikes: Strike angles in degrees (Right-Hand Rule).
+        dips: Dip angles in degrees [0, 90].
+        confidence: Fraction of poles to enclose (default 0.90 for P90).
+        projection: Stereonet projection type.
+        n_boundary_points: Number of vertices in the output polygon.
+    
+    Returns:
+        np.ndarray: Array of shape (n_boundary_points, 2) containing the
+            polygon vertices in stereonet (x, y) coordinates.
+    
+    Raises:
+        ValueError: If fewer than 3 orientations are provided or confidence
+            is outside (0, 1).
+    """
+    strikes = np.asarray(strikes, dtype=float)
+    dips = np.asarray(dips, dtype=float)
+    
+    if len(strikes) < 3:
+        raise ValueError("At least 3 orientations are required.")
+    if not 0 < confidence < 1:
+        raise ValueError("confidence must be between 0 and 1 (exclusive).")
+    
+    # Convert to pole coordinates and project using geokitpy to ensure matching coordinates
+    from geokitpy.stereonet import pole2plunge_bearing, Stereonet
+    
+    # geokitpy defaults to lower hemisphere and maps bearing/plunge to x, y based on projection
+    plunges, bearings = pole2plunge_bearing(strikes, dips)
+    
+    proj_map = {
+        "equal_area": "schmidt",
+        "equal_angle": "wulff"
+    }
+    snet_proj = proj_map.get(projection, "schmidt")
+    snet = Stereonet(projection=snet_proj, backend="plotly", grid=False)
+    
+    x_raw, y_raw = snet.to_xy(bearings, plunges)
+    
+    x = np.squeeze(x_raw)
+    y = np.squeeze(y_raw)
+    
+    # KDE on stereonet coordinates
+    from scipy.stats import gaussian_kde
+    xy = np.vstack([x, y])
+    kde = gaussian_kde(xy)
+    densities = kde(xy)
+    
+    # Find density threshold enclosing `confidence` fraction
+    sorted_densities = np.sort(densities)
+    n = len(sorted_densities)
+    idx = int(np.ceil((1 - confidence) * n)) - 1
+    idx = max(0, min(idx, n - 1))
+    threshold = sorted_densities[idx]
+    
+    # Generate contour on a grid
+    margin = 0.1
+    x_grid = np.linspace(x.min() - margin, x.max() + margin, 100)
+    y_grid = np.linspace(y.min() - margin, y.max() + margin, 100)
+    X, Y = np.meshgrid(x_grid, y_grid)
+    positions = np.vstack([X.ravel(), Y.ravel()])
+    Z = kde(positions).reshape(X.shape)
+    
+    # Extract contour at threshold
+    from skimage.measure import find_contours
+    contours = find_contours(Z, threshold)
+    
+    if not contours:
+        # Fallback: return convex hull of all points
+        from scipy.spatial import ConvexHull
+        hull = ConvexHull(np.column_stack([x, y]))
+        vertices = hull.vertices
+        polygon = np.column_stack([x[vertices], y[vertices]])
+        # Close the polygon
+        polygon = np.vstack([polygon, polygon[0]])
+        return polygon
+    
+    # Find largest contour
+    largest = max(contours, key=len)
+    
+    # Map contour indices back to stereonet coordinates
+    c_x = x_grid[0] + (largest[:, 1] / (Z.shape[1] - 1)) * (x_grid[-1] - x_grid[0])
+    c_y = y_grid[0] + (largest[:, 0] / (Z.shape[0] - 1)) * (y_grid[-1] - y_grid[0])
+    polygon = np.column_stack([c_x, c_y])
+    
+    # Resample to n_boundary_points if needed
+    if len(polygon) > n_boundary_points:
+        from scipy.interpolate import interp1d
+        diffs = np.diff(polygon, axis=0)
+        seg_lengths = np.sqrt((diffs ** 2).sum(axis=1))
+        cum_length = np.concatenate([[0], np.cumsum(seg_lengths)])
+        total = cum_length[-1]
+        
+        # Drop duplicates in cum_length to avoid interp1d errors
+        unique_idx = np.unique(cum_length, return_index=True)[1]
+        if len(unique_idx) > 1:
+            unique_cum = cum_length[unique_idx]
+            unique_poly = polygon[unique_idx]
+            
+            target_lengths = np.linspace(0, unique_cum[-1], n_boundary_points)
+            fx = interp1d(unique_cum, unique_poly[:, 0])
+            fy = interp1d(unique_cum, unique_poly[:, 1])
+            polygon = np.column_stack([fx(target_lengths), fy(target_lengths)])
+    
+    return polygon
+
+
 class Pcloud:
     
     def __init__(self, pandas_dataframe: pd.DataFrame, **kwargs):
@@ -1956,6 +2074,86 @@ class Pcloud:
             "max": float(np.max(dists)),
             "sum": float(np.sum(dists)),
         }
+
+    def bootstrap_fit_plane(
+        self,
+        method: Literal["pca", "least_squares", "svd", "ransac"] = "pca",
+        n_realizations: int = 500,
+        sample_fraction: float = 1.0,
+        residual_type: Literal["orthogonal_sum", "orthogonal_rmse"] = "orthogonal_rmse",
+        random_state: Optional[int] = None,
+        **kwargs,
+    ) -> pd.DataFrame:
+        """Fits multiple planes using bootstrap resampling to estimate uncertainty.
+
+        Args:
+            method: The plane fitting algorithm to use.
+            n_realizations: Number of bootstrap iterations.
+            sample_fraction: Fraction of points to sample per realization (0 to 1].
+            residual_type: Type of residual metric to optimize or report if applicable.
+            random_state: Seed for reproducibility.
+            **kwargs: Additional arguments passed to fit_plane_to_points.
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                ['strike', 'dip', 'dip_direction', 'residual_rmse', 'residual_sum',
+                 'centroid_x', 'centroid_y', 'centroid_z', 'normal_x', 'normal_y', 'normal_z']
+
+        Raises:
+            ValueError: If fewer than 3 points are available or sample_fraction is invalid.
+        """
+        pts = self.coord_values()
+        n_points = pts.shape[0]
+        if n_points < 3:
+            raise ValueError("At least 3 points are required to fit a plane.")
+        if not 0 < sample_fraction <= 1.0:
+            raise ValueError("sample_fraction must be between 0 and 1 (exclusive of 0).")
+            
+        sample_size = max(3, int(n_points * sample_fraction))
+        rng = np.random.default_rng(random_state)
+        
+        results = np.zeros((n_realizations, 11))
+        
+        valid_count = 0
+        original_points = self.data[['x', 'y', 'z']].values
+        
+        for i in range(n_realizations):
+            indices = rng.choice(n_points, size=sample_size, replace=True)
+            sub_df = self.data.iloc[indices][['x', 'y', 'z']].copy()
+            
+            try:
+                plane, _ = sub_df.pcloud.fit_plane_to_points(
+                    method=method, residual_type='orthogonal_rmse', **kwargs
+                )
+                
+                normal = np.asarray(plane, dtype=float)
+                normal_unit = normal / np.linalg.norm(normal)
+                centroid_sub = sub_df[['x', 'y', 'z']].mean().values
+                
+                distances = np.abs((original_points - centroid_sub) @ normal_unit)
+                residual_rmse = float(np.sqrt(np.mean(distances ** 2)))
+                residual_sum = float(np.sum(distances))
+                
+                results[valid_count, 0] = plane.strike
+                results[valid_count, 1] = plane.dip
+                results[valid_count, 2] = plane.dipdir
+                results[valid_count, 3] = residual_rmse
+                results[valid_count, 4] = residual_sum
+                results[valid_count, 5:8] = centroid_sub
+                results[valid_count, 8:11] = normal_unit
+                valid_count += 1
+            except Exception:
+                continue
+                
+        results = results[:valid_count]
+        
+        columns = [
+            'strike', 'dip', 'dip_direction', 'residual_rmse', 'residual_sum',
+            'centroid_x', 'centroid_y', 'centroid_z',
+            'normal_x', 'normal_y', 'normal_z'
+        ]
+        
+        return pd.DataFrame(results, columns=columns)
 
     def distance_to_surface(
         self,
