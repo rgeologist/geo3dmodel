@@ -9,10 +9,11 @@ from os import PathLike
 from copy import copy
 import itertools
 import numbers
+import logging
+logger = logging.getLogger(__name__)
 from typing import (Callable, Union, List, Tuple,
                     Optional, Literal, Sequence, Any)
 # import re
-# import logging
 import operator as py_operator
 from dataclasses import dataclass, field
 
@@ -54,7 +55,29 @@ class _LazyModuleCheck:
 OPEN3D = _LazyModuleCheck("open3d")
 PYVISTA = _LazyModuleCheck("pyvista")
 
+try:
+    import trimesh
+    HAS_TRIMESH = True
+except ImportError:
+    HAS_TRIMESH = False
+    trimesh = None
+
+try:
+    import geopandas
+    HAS_GEOPANDAS = True
+except ImportError:
+    HAS_GEOPANDAS = False
+    geopandas = None
+
+try:
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
+    go = None
+
 from geokitpy import geotensors as gkp
+from geokitpy.geotensors import Plane, Vector
 from geokitpy import geogis
 
 PointCollection = Union[List[Point], Tuple[Point, ...],
@@ -74,6 +97,116 @@ class Trimesh3d:
     def triangles(self) -> np.ndarray:
         """Alias for faces to maintain compatibility with open3d and trimesh conventions."""
         return self.faces
+
+    def unpack(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Unpacks vertices and faces to (x_flat, y_flat, z_flat, i, j, k) 1D arrays.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                x_flat, y_flat, z_flat coordinates and i, j, k triangle face indices.
+        """
+        x_flat = self.vertices[:, 0]
+        y_flat = self.vertices[:, 1]
+        z_flat = self.vertices[:, 2]
+        i = self.faces[:, 0]
+        j = self.faces[:, 1]
+        k = self.faces[:, 2]
+        return x_flat, y_flat, z_flat, i, j, k
+
+    to_xyz_ijk = unpack
+    unpack_xyz_ijk = unpack
+
+
+def intersect_trimesh_with_polyline(mesh: Trimesh3d, path: shapely.LineString) -> Tuple[List[float], List[float]]:
+    """
+    Vectorized intersection of a Trimesh3d with a vertical path (polyline).
+    
+    Args:
+        mesh (Trimesh3d): The 3D surface mesh to intersect.
+        path (shapely.LineString): The 2D path defining the vertical cross-section planes.
+        
+    Returns:
+        Tuple[List[float], List[float]]: A tuple containing lists of (distance_along_path, z_coordinates) 
+        with None separators between discontinuous segments, suitable for Plotly go.Scatter.
+    """
+    x_flat, y_flat, z_flat, i, j, k = mesh.unpack()
+    vertices = np.column_stack((x_flat, y_flat, z_flat))
+    triangles = vertices[np.column_stack((i, j, k))] # (N, 3, 3)
+    
+    path_coords = np.array(path.coords)
+    all_dists = []
+    all_zs = []
+    
+    # Iterate over segments of the path
+    for s_idx in range(len(path_coords) - 1):
+        A = path_coords[s_idx]
+        B = path_coords[s_idx + 1]
+        
+        # Normal vector of the vertical plane
+        n = np.array([A[1] - B[1], B[0] - A[0], 0.0])
+        norm_len = np.linalg.norm(n)
+        if norm_len < 1e-6: continue
+        n = n / norm_len
+        
+        # Plane equation D = n_x * (v_x - A_x) + n_y * (v_y - A_y)
+        d0 = np.dot(triangles[:, 0, :] - np.array([A[0], A[1], 0]), n)
+        d1 = np.dot(triangles[:, 1, :] - np.array([A[0], A[1], 0]), n)
+        d2 = np.dot(triangles[:, 2, :] - np.array([A[0], A[1], 0]), n)
+        
+        # Check which edges cross the plane
+        cross01 = d0 * d1 < 0
+        cross12 = d1 * d2 < 0
+        cross20 = d2 * d0 < 0
+        
+        # Triangles that intersect have exactly 2 edges crossing
+        intersecting_mask = (cross01.astype(int) + cross12.astype(int) + cross20.astype(int)) >= 2
+        
+        if not np.any(intersecting_mask):
+            continue
+        
+        t_tri = triangles[intersecting_mask]
+        cd0 = d0[intersecting_mask]
+        cd1 = d1[intersecting_mask]
+        cd2 = d2[intersecting_mask]
+        
+        c01 = cross01[intersecting_mask]
+        c12 = cross12[intersecting_mask]
+        c20 = cross20[intersecting_mask]
+        
+        # Calculate points
+        pts1 = np.where(c01[:, None], 
+                        t_tri[:, 0] - cd0[:, None] / (cd0 - cd1)[:, None] * (t_tri[:, 0] - t_tri[:, 1]),
+                        t_tri[:, 2] - cd2[:, None] / (cd2 - cd0)[:, None] * (t_tri[:, 2] - t_tri[:, 0]))
+                        
+        pts2 = np.where(c12[:, None], 
+                        t_tri[:, 1] - cd1[:, None] / (cd1 - cd2)[:, None] * (t_tri[:, 1] - t_tri[:, 2]),
+                        t_tri[:, 2] - cd2[:, None] / (cd2 - cd0)[:, None] * (t_tri[:, 2] - t_tri[:, 0]))
+        
+        # Filter segments to ensure they lie WITHIN the segment AB bounds
+        A_2d = A[:2]
+        B_2d = B[:2]
+        AB = B_2d - A_2d
+        L2 = np.dot(AB, AB)
+        
+        t1 = np.dot(pts1[:, :2] - A_2d, AB) / L2
+        t2 = np.dot(pts2[:, :2] - A_2d, AB) / L2
+        
+        valid = ((t1 >= 0) & (t1 <= 1)) | ((t2 >= 0) & (t2 <= 1)) | ((t1 < 0) & (t2 > 1)) | ((t2 < 0) & (t1 > 1))
+        
+        if not np.any(valid):
+            continue
+            
+        v_pts1 = pts1[valid]
+        v_pts2 = pts2[valid]
+        
+        for p1, p2 in zip(v_pts1, v_pts2):
+            d1_along = path.project(shapely.Point(p1[0], p1[1]))
+            d2_along = path.project(shapely.Point(p2[0], p2[1]))
+            all_dists.extend([d1_along, d2_along, None])
+            all_zs.extend([p1[2], p2[2], None])
+            
+    return all_dists, all_zs
+
 
 
 def check_strike_dip(strike: float, dip: float) -> None:
@@ -540,12 +673,12 @@ def build_vertical_surface(surface_path: shapely.Geometry,
         faces.append([i + 1, i + 1 + n_points, i + n_points])
     
     vertices = np.vstack((polyline_bottom, polyline_top))
-    surface = Trimesh3d(vertices=vertices, faces=faces)
+    surface = Trimesh3d(vertices=vertices, faces=np.asarray(faces, dtype=int))
     return surface
 
 
 def build_surface_from_polylines(line1: shapely.LineString,
-                                 line2: shapely.LineString) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int], List[int], List[int]]:
+                                 line2: shapely.LineString) -> Trimesh3d:
     """Takes two lines, performs a triangulation, and returns a 3D mesh.
 
     Args:
@@ -553,19 +686,21 @@ def build_surface_from_polylines(line1: shapely.LineString,
         line2 (shapely.LineString): The bottom line.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray, np.ndarray, List[int], List[int], List[int]]: The x, y, z coordinates and i, j, k indices for the triangles.
+        Trimesh3d: The resulting triangulated surface mesh.
 
     Raises:
         TypeError: If line1 or line2 is not a shapely.LineString.
     """
-    
     if not (isinstance(line1, shapely.LineString) and isinstance(line2, shapely.LineString)):
         raise TypeError("line1 and line2 must be shapely.LineString")
     
-    # Let's say you have your two 3D shapely LineStrings: top_line and bottom_line
+    if not line1.has_z:
+        line1 = shapely.force_3d(line1, z=0.0)
+    if not line2.has_z:
+        line2 = shapely.force_3d(line2, z=0.0)
+
     # 1. Determine how many resolution points you want (e.g., based on the denser line)
     num_points = max(len(line1.coords), len(line2.coords))
-    
     
     # 2. Resample both lines evenly along their lengths
     dists1 = np.linspace(0, line1.length, num_points)
@@ -575,15 +710,10 @@ def build_surface_from_polylines(line1: shapely.LineString,
     pts2 = np.array([line2.interpolate(d).coords[0] for d in dists2])
     
     # Stack vertices: Top line points come first, followed by Bottom line points
-    try:
-        all_pts = np.vstack([pts1, pts2])
-        x, y, z = all_pts[:, 0], all_pts[:, 1], all_pts[:, 2]
-    except IndexError:
-        pass
+    all_pts = np.vstack([pts1, pts2])
     
     # Initialize index arrays for the mesh triangles
-    i_idx, j_idx, k_idx = [], [], []
-    
+    faces = []
     n = len(pts1)
     for idx in range(n - 1):
         # Vertex indices for the current segment
@@ -593,19 +723,18 @@ def build_surface_from_polylines(line1: shapely.LineString,
         b2 = idx + 1 + n  # Next Bottom
     
         # Triangle 1: Top-Left, Top-Right, Bottom-Left
-        i_idx.append(t1)
-        j_idx.append(t2)
-        k_idx.append(b1)
+        faces.append([t1, t2, b1])
     
         # Triangle 2: Top-Right, Bottom-Right, Bottom-Left
-        i_idx.append(t2)
-        j_idx.append(b2)
-        k_idx.append(b1)
+        faces.append([t2, b2, b1])
         
-    return x,y,z,i_idx,j_idx,k_idx
+    faces_arr = np.asarray(faces, dtype=int) if faces else np.empty((0, 3), dtype=int)
+    return Trimesh3d(vertices=all_pts, faces=faces_arr)
+
 
 def build_vertical_surface_from_one_polyline_extrusion(line: shapely.LineString,
-                                             extrusion_distance: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[int], List[int], List[int]]:
+                    extrusion_distance: float,
+                    ) -> Trimesh3d:
     """Builds a vertical surface by extruding a single polyline downwards or upwards.
 
     Args:
@@ -613,7 +742,7 @@ def build_vertical_surface_from_one_polyline_extrusion(line: shapely.LineString,
         extrusion_distance (float): The distance to extrude in the Z direction.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray, np.ndarray, List[int], List[int], List[int]]: The x, y, z coordinates and i, j, k triangle indices.
+        Trimesh3d: The resulting vertical surface mesh.
 
     Raises:
         TypeError: If line is not a shapely.LineString.
@@ -634,8 +763,7 @@ def build_vertical_surface_from_one_polyline_extrusion(line: shapely.LineString,
     
     line2 = shapely.force_3d(shapely.force_2d(line), z=z_line2)
         
-    tup = build_surface_from_polylines(line, line2)
-    return tup
+    return build_surface_from_polylines(line, line2)
 
 # def build_vertical_surface_from_xy_z_orig(*,x:ArrayLike,
 #                                     y:ArrayLike,
@@ -710,12 +838,12 @@ def build_vertical_surface_from_one_polyline_extrusion(line: shapely.LineString,
 
 def build_triangulated_surface_from_lengths(*,
                                         n_horizontal: int,
-                                        n_vertical: int) -> tri.Triangulation:
+                                        n_vertical: int) -> Trimesh3d:
     """Builds a triangulated surface from the lengths of 2 dimensions.
 
     It is used to build any surface with 2 dimensions.
     The final triang_obj can be mapped to any coordinates.
-    The resulting triang_obj.triangles contain the flattened indices that can be used
+    The resulting triang_obj.triangles (or .faces) contain the flattened indices that can be used
     after to map real coordinates.
     
     It works best if the real coordinates have regular spacing.
@@ -726,17 +854,21 @@ def build_triangulated_surface_from_lengths(*,
         n_vertical (int): The number of vertical points.
 
     Returns:
-        tri.Triangulation: The created triangulation object.
+        Trimesh3d: The created triangulated mesh.
     """
-    hor = range(n_horizontal)
-    vert = range(n_vertical)
-    H, Z = np.meshgrid(hor,vert)
-    triang_obj = tri.Triangulation(H.flat, Z.flat)
-    return triang_obj
+    hor = np.arange(n_horizontal)
+    vert = np.arange(n_vertical)
+    H, Z = np.meshgrid(hor, vert)
+    h_flat = H.flatten()
+    z_flat = Z.flatten()
+    triang_obj = tri.Triangulation(h_flat, z_flat)
+    vertices = np.column_stack([h_flat.astype(float), np.zeros(h_flat.size, dtype=float), z_flat.astype(float)])
+    faces = np.asarray(triang_obj.triangles, dtype=int)
+    return Trimesh3d(vertices=vertices, faces=faces)
     
 def build_vertical_surface_polyline_and_zlevels(*, x: ArrayLike,
                                                 y: ArrayLike,
-                                                z: ArrayLike) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                                                z: ArrayLike) -> Trimesh3d:
     """Builds a vertical surface from a polyline at fixed depth and a series of depth levels.
 
     x, y and z are 1D arrays.
@@ -749,31 +881,34 @@ def build_vertical_surface_polyline_and_zlevels(*, x: ArrayLike,
         z (ArrayLike): 1D array of z levels.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]: The x, y, z flats and i, j, k triangle indices.
+        Trimesh3d: The resulting vertical surface mesh.
         
     Raises:
         ValueError: If x and y do not have the same length.
     """    
-    if x.size != y.size:
+    x_arr = np.asarray(x)
+    y_arr = np.asarray(y)
+    z_arr = np.asarray(z)
+    if x_arr.size != y_arr.size:
         raise ValueError('x and y must have the same length')
     
-    n_horizontal = x.size
-    n_vertical   = z.size
+    n_horizontal = x_arr.size
+    n_vertical   = z_arr.size
     
-    triang_obj = build_triangulated_surface_from_lengths(n_horizontal=n_horizontal,
+    triang_mesh = build_triangulated_surface_from_lengths(n_horizontal=n_horizontal,
                                                          n_vertical=n_vertical)
-    i_indices, j_indices, k_indices = triang_obj.triangles.T
     
-    X, Z = np.meshgrid(x, z)
-    Y, _ = np.meshgrid(y, z)
+    X, Z = np.meshgrid(x_arr, z_arr)
+    Y, _ = np.meshgrid(y_arr, z_arr)
         
     # Flatten them into 1D arrays
     x_flat = X.flatten()
     y_flat = Y.flatten()
     z_flat = Z.flatten()       
             
-    tup = x_flat, y_flat, z_flat, i_indices, j_indices, k_indices
-    return tup
+    vertices = np.column_stack([x_flat, y_flat, z_flat])
+    faces = triang_mesh.faces
+    return Trimesh3d(vertices=vertices, faces=faces)
 
 
 def map_array_to_cmap(*, values: ArrayLike,
@@ -880,10 +1015,10 @@ def map_rgb_image_to_vertical_surface(*, rgb: NDArray,
     if (x.size != rgb.shape[1]) or (z.size!=rgb.shape[0]):
         raise ValueError("This implementation needs that rgb.shape=(z.size, x.size, 3or4)")
         
-    tup1 = build_vertical_surface_polyline_and_zlevels(x=x,
-                                                        y=y,
-                                                        z=z)
-    x_flat, y_flat, z_flat, i_indices, j_indices, k_indices = tup1
+    mesh = build_vertical_surface_polyline_and_zlevels(x=x,
+                                                       y=y,
+                                                       z=z)
+    x_flat, y_flat, z_flat, i_indices, j_indices, k_indices = mesh.unpack()
     rgb_flat = rgb.reshape(-1,4)
     tup =  x_flat, y_flat, z_flat, i_indices, j_indices, k_indices, rgb_flat
     return tup
@@ -902,18 +1037,372 @@ def map_datarray_to_vertical_surface(*, datarray: xr.DataArray,
     Returns:
         Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]: The x, y, z flats, the i, j, k triangle indices, and the vertex colors.
     """
-    tup1 = build_vertical_surface_polyline_and_zlevels(x=datarray.x,
-                                                        y=datarray.y,
-                                                        z=datarray.z)
-    x_flat, y_flat, z_flat, i_indices, j_indices, k_indices = tup1
+    mesh = build_vertical_surface_polyline_and_zlevels(x=datarray.x,
+                                                       y=datarray.y,
+                                                       z=datarray.z)
+    x_flat, y_flat, z_flat, i_indices, j_indices, k_indices = mesh.unpack()
     
     vertex_colors = map_array_to_cmap(values=datarray.data,
                              mpl_cmap_name=mpl_cmap_name, **kwargs)
     tup =  x_flat, y_flat, z_flat, i_indices, j_indices, k_indices, vertex_colors
     return tup
-    
-    
-    
+
+
+def convert_path_to_orientation_vectors(
+    path_points: Any, **kwargs
+) -> Any:
+    """Compute 3D orientation direction vectors along a cross-section line path.
+
+    Calculates the directional difference vector (vx, vy, vz) between successive
+    points along the section trace. These tangent vectors define the orientation
+    of the vertical cross-section surface at each point.
+
+    Args:
+        path_points (geopandas.GeoDataFrame): Input path points containing geometry.
+        **kwargs: Additional keyword arguments.
+
+    Returns:
+        geopandas.GeoDataFrame: Path points updated with 'vx_xsection',
+            'vy_xsection', and 'vz_xsection' columns.
+    """
+    logger.info("Convert path to vectors")
+    coords = [pt.coords[0][:] for pt in path_points.geometry]
+    xsection_df = pd.DataFrame(np.array(coords), columns=["x", "y", "z"])
+
+    vx_xsection, vy_xsection, vz_xsection = xsection_df.diff().values.T
+    path_points = path_points.copy()
+    path_points["vx_xsection"] = vx_xsection
+    path_points["vy_xsection"] = vy_xsection
+    path_points["vz_xsection"] = vz_xsection
+    return path_points
+
+
+def project_structures_to_xsection(
+    path_points: Any,
+    structural_measurements: Any,
+    xsection_top: float = 7000.0,
+    xsection_bottom: float = -7000.0,
+    max_segment_length: float = 2.0,
+    debug_plot: bool = False,
+    **kwargs,
+) -> Any:
+    """Project 3D structural planes onto an irregular vertical cross-section trace.
+
+    Used when the structural data is away from the cross-section path.
+    Takes into account an arbitrary 3D shape of the vertical cross-section.
+    The intersection is computed between 3D planes (defined by strike and dip at each
+    measurement point) and a vertical surface extruded from the cross-section line.
+    For each structural plane, the point on the intersection line closest to the
+    original measurement location is returned.
+
+    Args:
+        path_points (geopandas.GeoDataFrame): Profile path points.
+        structural_measurements (geopandas.GeoDataFrame): Structural measurements with
+            strike and dip attributes ('structure_strike'/'strike', 'structure_dip'/'dip').
+        xsection_top (float, optional): Top elevation bound. Defaults to 7000.0.
+        xsection_bottom (float, optional): Bottom elevation bound. Defaults to -7000.0.
+        max_segment_length (float, optional): Maximum segment length for path resolution.
+            Defaults to 2.0.
+        debug_plot (bool, optional): If True, displays a 3D Plotly diagnostic model.
+            Defaults to False.
+        **kwargs: Additional keyword arguments.
+
+    Returns:
+        geopandas.GeoSeries: Series of projected 3D points on the section trace.
+
+    Raises:
+        RuntimeError: If trimesh is not installed.
+    """
+    if not HAS_TRIMESH or trimesh is None:
+        raise RuntimeError("trimesh module needed to run this function")
+
+    logger.info("Projecting structures into xsection trace")
+
+    path_ls = shapely.LineString(list(path_points.geometry)).segmentize(
+        max_segment_length=max_segment_length
+    )
+
+    polyline_3d_top = np.array(path_ls.coords)
+    polyline_3d_top[:, 2] = xsection_top
+    polyline_3d_bottom = polyline_3d_top.copy()
+    polyline_3d_bottom[:, 2] = xsection_bottom
+
+    # build xsection 3d surface
+    n_points = polyline_3d_top.shape[0]
+    faces = []
+    for i in range(n_points - 1):
+        # Two triangles per quad
+        faces.append([i, i + 1, i + n_points])
+        faces.append([i + 1, i + 1 + n_points, i + n_points])
+
+    vertices = np.vstack((polyline_3d_bottom, polyline_3d_top))
+    surface = trimesh.Trimesh(vertices=vertices, faces=faces)
+
+    # build structural planes
+    planes_origins = np.array(
+        [(pt.x, pt.y, pt.z) for pt in structural_measurements.geometry]
+    )
+    strike_col = (
+        "structure_strike"
+        if "structure_strike" in structural_measurements.columns
+        else "strike"
+    )
+    dip_col = (
+        "structure_dip"
+        if "structure_dip" in structural_measurements.columns
+        else "dip"
+    )
+
+    planes = [
+        gkp.Plane(getattr(row, strike_col), getattr(row, dip_col))
+        for row in structural_measurements.itertuples()
+    ]
+    plane_iter = iter(zip(planes, planes_origins))
+
+    # compute intersections
+    intersections = [
+        surface.section(plane, plane_orig) for plane, plane_orig in plane_iter
+    ]
+    intersections_vertices = [
+        intersection.vertices
+        if (intersection is not None and hasattr(intersection, "vertices"))
+        else np.empty((0, 3))
+        for intersection in intersections
+    ]
+
+    # for each structural plane, find the closest point
+    closest_pts_list = []
+    for origin, intersection in zip(planes_origins, intersections_vertices):
+        if len(intersection) == 0:
+            closest_pts_list.append(shapely.Point(origin))
+            continue
+        origin_pt = shapely.Point(origin)
+        inters_points = [shapely.Point(*coords) for coords in intersection]
+        distances = [origin_pt.distance(inters_pt) for inters_pt in inters_points]
+        pt_idx = distances.index(min(distances))
+        closest_pts_list.append(inters_points[pt_idx])
+
+    crs = getattr(path_points, "crs", None)
+    if geopandas is not None:
+        pts_series = geopandas.GeoSeries(
+            data=closest_pts_list,
+            index=structural_measurements.index,
+            crs=crs,
+            name="stru_measurements_projected",
+        )
+    else:
+        pts_series = pd.Series(
+            data=closest_pts_list,
+            index=structural_measurements.index,
+            name="stru_measurements_projected",
+        )
+
+    if debug_plot and HAS_PLOTLY and go is not None:
+        # Extract vertices and faces for Plotly
+        x, y, z = surface.vertices.T
+        i, j, k = surface.faces.T
+
+        fig = go.Figure()
+        traces = []
+        mesh = go.Mesh3d(x=x, y=y, z=z, i=i, j=j, k=k, color="lightblue", opacity=0.50)
+        traces.append(mesh)
+
+        for vertices_arr in intersections_vertices:
+            if len(vertices_arr) > 0:
+                intersection_trace = go.Scatter3d(
+                    x=vertices_arr[:, 0],
+                    y=vertices_arr[:, 1],
+                    z=vertices_arr[:, 2],
+                    mode="markers",
+                )
+                traces.append(intersection_trace)
+
+        fig.add_traces(traces)
+        fig.update_layout(
+            title="3D Extruded Surface",
+            scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
+        )
+        fig.show()
+
+    return pts_series
+
+
+def intersect_structures_and_xsection(
+    geology_on_path: Any, **kwargs
+) -> Any:
+    """Find intersections between structural planes and local vertical cross-section planes.
+
+    Makes a simple intersection when structures are already on the cross-section path.
+    The intersection is made between two 3D planes:
+        - A local vertical plane in the cross-section trace
+        - The structural 3D plane
+
+    Args:
+        geology_on_path (geopandas.GeoDataFrame): Profile path dataset containing
+            orientation vectors (vx_xsection, vy_xsection, vz_xsection) and structural
+            data (structure_strike, structure_dip).
+        **kwargs: Additional keyword arguments.
+
+    Returns:
+        geopandas.GeoDataFrame: Profile dataset updated with intersection attributes:
+            'x_intersection', 'y_intersection', 'z_intersection', 'stru_apparent_dip',
+            'intersection_trend', and 'intersection_plunge'.
+    """
+    logger.info("Find intersections between planes and xsection")
+    # keep only structural points
+    structure_pts = ("structure_contact", "structure_measurement")
+    if "point_type" in geology_on_path.columns:
+        structural_data_mask = geology_on_path.point_type.isin(structure_pts)
+        structural_data = geology_on_path[structural_data_mask].copy()
+    else:
+        structural_data = geology_on_path.copy()
+
+    strike_col = (
+        "structure_strike"
+        if "structure_strike" in structural_data.columns
+        else "strike"
+    )
+    dip_col = (
+        "structure_dip"
+        if "structure_dip" in structural_data.columns
+        else "dip"
+    )
+
+    # generate list of structural planes
+    strike_list = [getattr(row, strike_col) for row in structural_data.itertuples()]
+    dip_list = [getattr(row, dip_col) for row in structural_data.itertuples()]
+    planes_list = [gkp.Plane(strike, dip) for strike, dip in zip(strike_list, dip_list)]
+    planes = np.array(planes_list).view(gkp.Plane)
+
+    # calculate trend of xsection at each point
+    xsection_vectors_df = structural_data.loc[
+        :, ["vx_xsection", "vy_xsection", "vz_xsection"]
+    ]
+    xsection_vectors = gkp.Vector(xsection_vectors_df.values)
+    xsection_trends = xsection_vectors.trend
+    xsection_planes = gkp.Plane(xsection_trends, [90] * len(xsection_trends))
+
+    # Get intersections between structural planes and the xsection and make sure
+    # those intersections are vectors pointing down
+    apparent_planes = planes.intersection(xsection_planes)
+    condition = np.atleast_2d(apparent_planes[:, 2] > 0).T
+    apparent_planes = np.where(condition, apparent_planes * -1, apparent_planes).view(
+        gkp.Vector
+    )
+    dips = apparent_planes.plunge
+
+    new_data = {
+        "x_intersection": [pl[0] for pl in apparent_planes],
+        "y_intersection": [pl[1] for pl in apparent_planes],
+        "z_intersection": [pl[2] for pl in apparent_planes],
+        "stru_apparent_dip": dips,
+        "intersection_trend": [v.trend for v in apparent_planes],
+        "intersection_plunge": dips,
+    }
+    structure_df = pd.DataFrame(data=new_data, index=structural_data.index)
+    new_geology_on_path = pd.concat([geology_on_path, structure_df], axis=1)
+    return new_geology_on_path
+
+
+def generate_structural_vectors(
+    geology_on_path: Any, symbol_size: float = 200.0, **kwargs
+) -> Any:
+    """Generate 2D apparent dip vector symbols for plotting on cross-section profile.
+
+    Projects 3D plane intersection vectors onto the cross-section plane to determine
+    in-plane horizontal and vertical apparent dip vector components and line segment
+    endpoints for 2D cross-section visualization.
+
+    Args:
+        geology_on_path (geopandas.GeoDataFrame): Section path dataset with apparent dips
+            and intersection coordinates.
+        symbol_size (float, optional): Apparent dip vector length on plot. Defaults to 200.0.
+        **kwargs: Additional keyword arguments.
+
+    Returns:
+        geopandas.GeoDataFrame: Section dataset updated with vector symbol coordinates
+            ('x0_stru_symbol', 'x1_stru_symbol', 'z0_stru_symbol', 'z1_stru_symbol',
+            'vhor_structure', 'vz_structure').
+    """
+    logger.info("Generate vectors of apparent dips")
+
+    # keep only structural points
+    structure_pts = ("structure_contact", "structure_measurement")
+    if "point_type" in geology_on_path.columns:
+        structural_data_mask = geology_on_path.point_type.isin(structure_pts)
+        structural_data = geology_on_path[structural_data_mask].copy()
+    else:
+        structural_data = geology_on_path.copy()
+
+    # calculate horizontal projection of structure
+    stru_projected_vectors_df = structural_data.loc[
+        :, ["x_intersection", "y_intersection", "z_intersection"]
+    ]
+    stru_projected_vectors = gkp.Vector(stru_projected_vectors_df.values)
+    stru_projected_vectors_trends = stru_projected_vectors.trend
+    horizontal = stru_projected_vectors_df.pow(2).sum(axis=1).pow(0.5)
+
+    # calculate trend of xsection at each point
+    xsection_vectors_df = structural_data.loc[
+        :, ["vx_xsection", "vy_xsection", "vz_xsection"]
+    ]
+    xsection_vectors = gkp.Vector(xsection_vectors_df.values)
+    xsection_trends = xsection_vectors.trend
+
+    # compare the trends of structures and xsection
+    same_directions = abs(stru_projected_vectors_trends - xsection_trends) < 10
+    horizontal = horizontal.where(same_directions, horizontal * -1)
+    structure_vector_df = pd.DataFrame(
+        [horizontal, structural_data.z_intersection],
+        index=["vhor_structure", "vz_structure"],
+    ).T
+
+    structure_df = pd.concat([structural_data, structure_vector_df], axis=1)
+
+    # build structural symbols
+    stru_vector = gkp.Vector(
+        np.vstack(
+            (
+                structure_df.vhor_structure.values,
+                [0] * structure_df.shape[0],
+                structure_df.vz_structure.values,
+            )
+        ).T
+    )
+    stru_vector = stru_vector.unit * symbol_size
+
+    if "hor_distance_geogis" in structure_df.columns:
+        x0 = structure_df["hor_distance_geogis"].values
+    elif "hor_distance" in structure_df.columns:
+        x0 = structure_df["hor_distance"].values
+    else:
+        x0 = np.zeros(structure_df.shape[0])
+
+    x1 = x0 + stru_vector[:, 0]
+    z0 = [pt.z for pt in structure_df.geometry]
+    z1 = z0 + stru_vector[:, 2]
+
+    structure_df = pd.concat(
+        [
+            pd.DataFrame(
+                data=[x0, x1, z0, z1],
+                index=[
+                    "x0_stru_symbol",
+                    "x1_stru_symbol",
+                    "z0_stru_symbol",
+                    "z1_stru_symbol",
+                ],
+                columns=structure_df.index,
+            ).T,
+            structure_vector_df,
+        ],
+        axis=1,
+    ).dropna(axis=1)
+
+    geology_on_path = pd.concat([geology_on_path, structure_df], axis=1)
+
+    return geology_on_path
+
 
 def orientations_to_pcloud(strikes: ArrayLike, dips: ArrayLike, centers: ArrayLike, radius: float = 1, num_sides: int = 15, **kwargs) -> pd.DataFrame:
     """Takes arrays of orientation data and builds disks to create a point cloud.

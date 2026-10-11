@@ -24,6 +24,10 @@ from geo3dmodel.model3d import (
     Trimesh3d,
     build_surface_from_disks,
     build_vertical_surface,
+    build_surface_from_polylines,
+    build_vertical_surface_from_one_polyline_extrusion,
+    build_triangulated_surface_from_lengths,
+    build_vertical_surface_polyline_and_zlevels,
     compute_surface_boundary_polygon,
     generate_masked_surface_grid,
     fit_surface_z_weighted_avg,
@@ -35,9 +39,23 @@ from geo3dmodel.model3d import (
     interpolate_surface_z_rbf,
     interpolate_surface_z_bspline,
     build_transformed_trimesh3d,
+    map_rgb_image_to_vertical_surface,
+    map_datarray_to_vertical_surface,
+    convert_path_to_orientation_vectors,
+    project_structures_to_xsection,
+    intersect_structures_and_xsection,
+    generate_structural_vectors,
 )
 from geokitpy import geotensors as gkp
 import shapely
+import xarray as xr
+
+try:
+    import geopandas as gpd
+    HAS_GEOPANDAS = True
+except ImportError:
+    HAS_GEOPANDAS = False
+    gpd = None
 
 
 class TestModel3D(unittest.TestCase):
@@ -55,6 +73,21 @@ class TestModel3D(unittest.TestCase):
         # Test .triangles alias compatibility
         self.assertTrue(np.array_equal(mesh.triangles, mesh.faces))
 
+        # Test .unpack() method
+        x_flat, y_flat, z_flat, i, j, k = mesh.unpack()
+        self.assertTrue(np.array_equal(x_flat, [0, 1, 0]))
+        self.assertTrue(np.array_equal(y_flat, [0, 0, 1]))
+        self.assertTrue(np.array_equal(z_flat, [0, 0, 0]))
+        self.assertTrue(np.array_equal(i, [0]))
+        self.assertTrue(np.array_equal(j, [1]))
+        self.assertTrue(np.array_equal(k, [2]))
+
+        # Test aliases
+        for a, b in zip(mesh.to_xyz_ijk(), (x_flat, y_flat, z_flat, i, j, k)):
+            self.assertTrue(np.array_equal(a, b))
+        for a, b in zip(mesh.unpack_xyz_ijk(), (x_flat, y_flat, z_flat, i, j, k)):
+            self.assertTrue(np.array_equal(a, b))
+
     def test_build_surface_from_disks(self):
         disk1 = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]])
         disk2 = np.array([[0, 0, 1], [1, 0, 1], [0, 1, 1]])
@@ -68,6 +101,72 @@ class TestModel3D(unittest.TestCase):
         self.assertIsInstance(mesh, Trimesh3d)
         self.assertTrue(len(mesh.vertices) > 0)
         self.assertTrue(len(mesh.faces) > 0)
+        self.assertEqual(mesh.vertices.shape[1], 3)
+        self.assertEqual(mesh.faces.shape[1], 3)
+
+    def test_build_surface_from_polylines(self):
+        line1 = shapely.LineString([(0, 0, 10), (10, 0, 10)])
+        line2 = shapely.LineString([(0, 0, 0), (10, 0, 0)])
+        mesh = build_surface_from_polylines(line1, line2)
+        self.assertIsInstance(mesh, Trimesh3d)
+        self.assertEqual(mesh.vertices.shape[1], 3)
+        self.assertEqual(mesh.faces.shape[1], 3)
+        self.assertGreater(len(mesh.vertices), 0)
+        self.assertGreater(len(mesh.faces), 0)
+        self.assertTrue(np.array_equal(mesh.triangles, mesh.faces))
+
+    def test_build_vertical_surface_from_one_polyline_extrusion(self):
+        line = shapely.LineString([(0, 0, 10), (10, 5, 10)])
+        mesh = build_vertical_surface_from_one_polyline_extrusion(line, extrusion_distance=-20)
+        self.assertIsInstance(mesh, Trimesh3d)
+        self.assertEqual(mesh.vertices.shape[1], 3)
+        self.assertEqual(mesh.faces.shape[1], 3)
+        self.assertGreater(len(mesh.vertices), 0)
+        self.assertGreater(len(mesh.faces), 0)
+        self.assertTrue(np.array_equal(mesh.triangles, mesh.faces))
+
+    def test_build_triangulated_surface_from_lengths(self):
+        mesh = build_triangulated_surface_from_lengths(n_horizontal=5, n_vertical=4)
+        self.assertIsInstance(mesh, Trimesh3d)
+        self.assertEqual(mesh.vertices.shape, (20, 3))
+        self.assertEqual(mesh.faces.shape[1], 3)
+        self.assertTrue(np.array_equal(mesh.triangles, mesh.faces))
+
+    def test_build_vertical_surface_polyline_and_zlevels(self):
+        x = np.array([0.0, 5.0, 10.0])
+        y = np.array([0.0, 2.0, 4.0])
+        z = np.array([0.0, -10.0, -20.0, -30.0])
+        mesh = build_vertical_surface_polyline_and_zlevels(x=x, y=y, z=z)
+        self.assertIsInstance(mesh, Trimesh3d)
+        self.assertEqual(mesh.vertices.shape, (12, 3))
+        self.assertEqual(mesh.faces.shape[1], 3)
+        self.assertTrue(np.array_equal(mesh.triangles, mesh.faces))
+
+    def test_map_rgb_image_to_vertical_surface(self):
+        x = np.array([0.0, 5.0, 10.0])
+        y = np.array([0.0, 2.0, 4.0])
+        z = np.array([0.0, -10.0, -20.0, -30.0])
+        rgb = np.ones((len(z), len(x), 4), dtype=float)
+        x_flat, y_flat, z_flat, i_idx, j_idx, k_idx, rgb_flat = map_rgb_image_to_vertical_surface(
+            rgb=rgb, x=x, y=y, z=z
+        )
+        self.assertEqual(len(x_flat), 12)
+        self.assertEqual(len(i_idx), len(j_idx))
+        self.assertEqual(len(j_idx), len(k_idx))
+        self.assertEqual(rgb_flat.shape, (12, 4))
+
+    def test_map_datarray_to_vertical_surface(self):
+        x = np.array([0.0, 5.0, 10.0])
+        y = np.array([0.0, 2.0, 4.0])
+        z = np.array([0.0, -10.0, -20.0, -30.0])
+        data = np.ones((len(z), len(x)))
+        da = xr.DataArray(data, coords={"z": z, "x": x, "y": ("x", y)}, dims=["z", "x"])
+        x_flat, y_flat, z_flat, i_idx, j_idx, k_idx, colors = map_datarray_to_vertical_surface(
+            datarray=da
+        )
+        self.assertEqual(len(x_flat), 12)
+        self.assertEqual(len(i_idx), len(j_idx))
+        self.assertEqual(colors.shape, (12, 4))
 
     def test_fit_with_weighted_avg_basic(self):
         # Create a synthetic planar patch of 3D points
@@ -342,6 +441,69 @@ class TestModel3D(unittest.TestCase):
     @unittest.skipIf(not HAS_PYVISTA, "pyvista not installed")
     def test_pyvista_feature(self):
         pass
+
+    @unittest.skipIf(not HAS_GEOPANDAS, "geopandas not installed")
+    def test_convert_path_to_orientation_vectors(self):
+        pts = [shapely.Point(0, 0, 0), shapely.Point(10, 0, 0), shapely.Point(10, 10, 0)]
+        gdf = gpd.GeoDataFrame({"geometry": pts})
+        res = convert_path_to_orientation_vectors(gdf)
+        self.assertIn("vx_xsection", res.columns)
+        self.assertIn("vy_xsection", res.columns)
+        self.assertIn("vz_xsection", res.columns)
+        self.assertEqual(res["vx_xsection"].iloc[1], 10.0)
+        self.assertEqual(res["vy_xsection"].iloc[2], 10.0)
+
+    @unittest.skipIf(not HAS_GEOPANDAS, "geopandas not installed")
+    def test_intersect_structures_and_xsection(self):
+        pts = [shapely.Point(0, 0, 0), shapely.Point(10, 0, 0)]
+        gdf = gpd.GeoDataFrame({
+            "geometry": pts,
+            "vx_xsection": [1.0, 1.0],
+            "vy_xsection": [0.0, 0.0],
+            "vz_xsection": [0.0, 0.0],
+            "structure_strike": [90.0, 90.0],
+            "structure_dip": [45.0, 45.0],
+            "point_type": ["structure_measurement", "structure_contact"],
+        })
+        res = intersect_structures_and_xsection(gdf)
+        self.assertIn("x_intersection", res.columns)
+        self.assertIn("y_intersection", res.columns)
+        self.assertIn("z_intersection", res.columns)
+        self.assertIn("stru_apparent_dip", res.columns)
+
+    @unittest.skipIf(not HAS_GEOPANDAS, "geopandas not installed")
+    def test_generate_structural_vectors(self):
+        pts = [shapely.Point(0, 0, 0), shapely.Point(10, 0, 0)]
+        gdf = gpd.GeoDataFrame({
+            "geometry": pts,
+            "vx_xsection": [1.0, 1.0],
+            "vy_xsection": [0.0, 0.0],
+            "vz_xsection": [0.0, 0.0],
+            "structure_strike": [90.0, 90.0],
+            "structure_dip": [45.0, 45.0],
+            "point_type": ["structure_measurement", "structure_contact"],
+        })
+        gdf = intersect_structures_and_xsection(gdf)
+        gdf["hor_distance_geogis"] = [0.0, 10.0]
+        res = generate_structural_vectors(gdf, symbol_size=50)
+        self.assertIn("x0_stru_symbol", res.columns)
+        self.assertIn("x1_stru_symbol", res.columns)
+        self.assertIn("z0_stru_symbol", res.columns)
+        self.assertIn("z1_stru_symbol", res.columns)
+
+    @unittest.skipIf(not (HAS_GEOPANDAS and HAS_TRIMESH), "geopandas or trimesh not installed")
+    def test_project_structures_to_xsection(self):
+        path_pts = [shapely.Point(0, 0, 0), shapely.Point(100, 0, 0)]
+        path_gdf = gpd.GeoDataFrame({"geometry": path_pts})
+        stru_pts = [shapely.Point(50, 10, 0)]
+        stru_gdf = gpd.GeoDataFrame({
+            "geometry": stru_pts,
+            "structure_strike": [90.0],
+            "structure_dip": [45.0],
+        })
+        res = project_structures_to_xsection(path_gdf, stru_gdf)
+        self.assertEqual(len(res), 1)
+        self.assertIsInstance(res.iloc[0], shapely.Point)
 
 
 if __name__ == "__main__":
