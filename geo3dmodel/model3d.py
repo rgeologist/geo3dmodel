@@ -208,6 +208,56 @@ def intersect_trimesh_with_polyline(mesh: Trimesh3d, path: shapely.LineString) -
     return all_dists, all_zs
 
 
+def intersect_trimesh_with_horizontal_plane(mesh, z: float, decimals: int = 6) -> list:
+    """Intersects a Trimesh3d with a horizontal plane at elevation `z`.
+
+    Args:
+        mesh: A `Trimesh3d` instance (exposes `unpack()` -> x, y, z, i, j, k).
+        z (float): Elevation of the horizontal plane (same units/sign convention as the mesh
+            vertices, i.e. positive up).
+        decimals (int): Rounding applied to the intersection points so that segments from
+            neighbouring triangles share identical end points and can be merged.
+
+    Returns:
+        list[shapely.LineString]: The merged intersection traces (2D, x/y). Closed traces
+        (`line.is_ring`) can be converted to polygons with `shapely.Polygon(line)`. Empty list
+        if the plane does not cut the mesh.
+    """
+    import shapely
+    import shapely.ops
+
+    x_flat, y_flat, z_flat, i, j, k = mesh.unpack()
+    vertices = np.column_stack((x_flat, y_flat, z_flat))
+    tri = vertices[np.column_stack((i, j, k))]  # (N, 3, 3)
+
+    d = tri[:, :, 2] - z                         # signed distance to the plane
+    above = d >= 0                               # vertices on the plane count as "above"
+    n_above = above.sum(axis=1)
+    mask = (n_above == 1) | (n_above == 2)       # triangles crossed by the plane
+    if not np.any(mask):
+        return []
+
+    tri, d, above = tri[mask], d[mask], above[mask]
+    edges = np.array([[0, 1], [1, 2], [2, 0]])
+    ia, ib = edges[:, 0], edges[:, 1]
+    cross = above[:, ia] != above[:, ib]          # (M, 3) exactly two True per triangle
+
+    da, db = d[:, ia], d[:, ib]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t = da / (da - db)                        # (M, 3)
+    pts = tri[:, ia, :] + t[:, :, None] * (tri[:, ib, :] - tri[:, ia, :])  # (M, 3, 3)
+
+    idx = np.argsort(~cross, axis=1, kind='stable')[:, :2]
+    rows = np.arange(len(tri))[:, None]
+    p = np.round(pts[rows, idx][:, :, :2], decimals)  # (M, 2, 2)
+
+    segments = [shapely.LineString(seg) for seg in p if not np.array_equal(seg[0], seg[1])]
+    if not segments:
+        return []
+    merged = shapely.ops.linemerge(shapely.ops.unary_union(segments))
+    return list(merged.geoms) if merged.geom_type == 'MultiLineString' else [merged]
+
+
 
 def check_strike_dip(strike: float, dip: float) -> None:
     """Checks if the provided strike and dip are valid numbers.
